@@ -62,14 +62,14 @@ duration (minutes or hours)
 Blasting Policy Options
 
 Blast at will
-→ blasting can occur at any time once charging is complete
+→ blasting can occur at any time once charging is complete. If Blast at will is selected, the other headings need to pause all work while blasting continues for one hour.
 
 End-of-shift only
-→ blasting is constrained to shift boundaries
+→ blasting is constrained to shift boundaries and is subject to re-entry periods
 
 Optional Constraints
 
-Post-blast re-entry delay
+Post-blast re-entry delay = 30 minutes
 
 Maximum blasts per day
 
