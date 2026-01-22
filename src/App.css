@@ -1,0 +1,48 @@
+import React, { useMemo, useState } from "react";
+import { Scenario } from "./models/types";
+import { simulateDay } from "./sim/simulate";
+import { ScenarioEditor } from "./ui/ScenarioEditor";
+import { ResultsPanel } from "./ui/ResultsPanel";
+import { defaultScenario } from "./ui/defaultScenario";
+
+export default function App() {
+  const [scenario, setScenario] = useState<Scenario>(defaultScenario);
+  const [runId, setRunId] = useState(0);
+
+  const result = useMemo(() => {
+    return simulateDay(scenario);
+  }, [scenario, runId]);
+
+  return (
+    <div style={{ maxWidth: 1100, margin: "0 auto", padding: 16 }}>
+      <header style={{ marginBottom: 16 }}>
+        <h1>Multiblast</h1>
+        <p>
+          Estimating advance rates for development mining scenarios using a
+          deterministic simulation.
+        </p>
+      </header>
+
+      <button onClick={() => setRunId(r => r + 1)}>
+        Run simulation
+      </button>
+
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "1.2fr 0.8fr",
+          gap: 16,
+          marginTop: 16
+        }}
+      >
+        <div style={{ border: "1px solid #ccc", padding: 12 }}>
+          <ScenarioEditor scenario={scenario} onChange={setScenario} />
+        </div>
+
+        <div style={{ border: "1px solid #ccc", padding: 12 }}>
+          <ResultsPanel result={result} />
+        </div>
+      </div>
+    </div>
+  );
+}
