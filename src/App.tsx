@@ -1,45 +1,28 @@
-import { useMemo, useState } from "react";
-import "./App.css";
-
-
-
-import ResultsPanel from "./ui/ResultsPanel";
-import { ScenarioEditor } from "./ui/ScenarioEditor";
-
 import { defaultScenario } from "./models/defaultScenario";
-import type { Scenario, SimResult, TimeBreakdownMin } from "./models/types";
-
-function emptyBreakdown(): TimeBreakdownMin {
-  return {} as TimeBreakdownMin;
-}
+import { simulateScenario } from "./engine/simulate";
 
 export default function App() {
-  const [scenario, setScenario] = useState<Scenario>(defaultScenario);
+  // Test: reduce to 2 shifts/day to force off-shift behavior
+  const scenario = {
+    ...defaultScenario,
+    shiftsPerDay: 2,
+  };
 
-  // Temporary stub result (replace with real simulation later)
-  const result: SimResult = useMemo(() => {
-    const roundsPerHeading = Array.from(
-      { length: scenario.headings },
-      () => 2
-    );
-
-    return {
-      scenarioName: scenario.name,
-      roundsPerHeading,
-      roundsPerDayAvg: 2.0,
-      advancePerHeadingMPerDayAvg: 2.0 * scenario.advancePerRoundM,
-      systemRoundsPerDay: roundsPerHeading.reduce((a, b) => a + b, 0),
-      systemAdvanceMPerDay:
-        roundsPerHeading.reduce((a, b) => a + b, 0) *
-        scenario.advancePerRoundM,
-      breakdown: emptyBreakdown(),
-    };
-  }, [scenario]);
+  const result = simulateScenario(scenario, {
+    simDays: 7,
+    hoursPerShift: 8,
+    recordRuns: false,
+  });
 
   return (
-    <div style={{ padding: 16, display: "grid", gap: 16 }}>
-      <ScenarioEditor scenario={scenario} onChange={setScenario} />
-      <ResultsPanel result={result} />
+    <div style={{ padding: 24, fontFamily: "system-ui" }}>
+      <h1>Multiblast – Simulation Test</h1>
+
+      <h2>Scenario</h2>
+      <pre>{JSON.stringify(scenario, null, 2)}</pre>
+
+      <h2>KPIs (7-day simulation)</h2>
+      <pre>{JSON.stringify(result.kpis, null, 2)}</pre>
     </div>
   );
 }
