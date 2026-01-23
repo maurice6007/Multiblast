@@ -1,7 +1,5 @@
 import { DebugSimulationTest } from "./ui/DebugSimulationTest";
 
-function App() {
+export default function App() {
   return <DebugSimulationTest />;
 }
-
-export default App;

@@ -1,5 +1,85 @@
 // src/engine/simulate.ts
-import type { Scenario, SimulationResult, Stage, StageRun } from "../models/types";
+// Deterministic shift-aware, blast-lockout-aware simulator with shared (contention) resources.
+// Resources are shared across headings and cannot work simultaneously on multiple headings.
+
+export type Policy = "END_OF_SHIFT_ONLY" | "IMMEDIATE";
+
+export interface Stage {
+  id: string;
+  name: string;
+  durationMin: number;
+  isBlast?: boolean;
+
+  /**
+   * Optional explicit resource mapping. If omitted, we infer from stage.id:
+   *  - contains "DRILL"  -> DRILL_RIG
+   *  - contains "MUCK"   -> LHD
+   *  - contains "CHARGE" -> CHARGING_CREW
+   */
+  resourceKey?: ResourceKey;
+}
+
+export interface Scenario {
+  name: string;
+  policy: Policy;
+
+  headings: number;
+  shiftsPerDay: number;
+  advancePerRoundM: number;
+
+  reEntryDelayMin: number;
+  blastLockoutMin: number;
+
+  stages: Stage[];
+}
+
+export interface StageRun {
+  headingIndex: number;
+  roundIndex: number;
+  stageId: string;
+  stageName: string;
+  startMin: number;
+  endMin: number;
+  meta?: { isBlast?: boolean; resourceKey?: ResourceKey; resourceUnitIndex?: number };
+}
+
+export interface ResourceUtilization {
+  resourceKey: ResourceKey;
+  units: number;
+  busyMin: number;
+  availableMin: number;
+  utilization: number; // 0..1
+}
+
+export interface SimulationResult {
+  scenarioName: string;
+  policy: Policy;
+  minutesPerDay: number;
+  shiftMinutes: number;
+  runs: StageRun[];
+  resourceUtilization: ResourceUtilization[];
+  kpis: {
+    simDays: number;
+
+    roundsCompletedTotal: number;
+    roundsCompletedPerHeading: number;
+
+    metresAdvancedTotal: number;
+    metresAdvancedPerHeading: number;
+
+    roundsPerDayTotal: number;
+    metresPerDayTotal: number;
+
+    headingUtilization: number; // average across headings based on scheduled minutes
+  };
+}
+
+export type ResourceKey =
+  | "DRILL_RIG"
+  | "LHD"
+  | "CHARGING_CREW"
+  | "SUPPORT_CREW";
+
 
 export interface SimulateOptions {
   /** Simulation horizon in days. Deterministic: same inputs => same outputs. */
@@ -10,6 +90,18 @@ export interface SimulateOptions {
 
   /** If true, record every StageRun event. Default true. */
   recordRuns?: boolean;
+
+  /**
+   * Shared resources across headings. If a stage requires a resource and capacity is missing/0, we throw.
+   * Stages infer requirements by stage.id unless stage.resourceKey is set explicitly.
+   */
+  resources?: {
+  drillRigs?: number;
+  lhds?: number;
+  chargingCrews?: number;
+  supportCrews?: number;
+};
+
 }
 
 const MIN_PER_HOUR = 60;
@@ -107,8 +199,6 @@ function normalizeToWorkingTime(tMin: number, shiftMinutes: number, shiftsPerDay
  * Fit a stage start into the current shift:
  * - If stage fits fully before shift end, keep tMin.
  * - Otherwise defer stage to the next shift boundary (no partial-stage work).
- *
- * Works for BOTH policies (Option 1): work only occurs during scheduled shifts.
  */
 function fitStageIntoShift(
   tMin: number,
@@ -127,7 +217,7 @@ function fitStageIntoShift(
 }
 
 /**
- * Policy meaning (Option 1):
+ * Policy meaning:
  * - END_OF_SHIFT_ONLY: rounds can only start at shift boundary.
  * - IMMEDIATE: rounds can start any time within working time.
  * Both policies: work only during scheduled shifts.
@@ -143,7 +233,78 @@ function roundStartTime(tProposed: number, scenario: Scenario, shiftMinutes: num
   return tWorking;
 }
 
-/** ✅ Named export (this is what App/UI imports) */
+// ---------------- Resource mapping + pool ----------------
+
+function inferResourceKey(stageId: string): ResourceKey | null {
+  const s = stageId.toUpperCase();
+  if (s.includes("DRILL")) return "DRILL_RIG";
+  if (s.includes("MUCK") || s.includes("LHD")) return "LHD";
+  if (s.includes("CHARGE")) return "CHARGING_CREW";
+  if (s.includes("SUPPORT") || s.includes("BOLT") || s.includes("SHOT")) return "SUPPORT_CREW";
+  return null;
+}
+
+
+function getStageResourceKey(stage: Stage): ResourceKey | null {
+  if (stage.resourceKey === "DRILL_RIG" || stage.resourceKey === "LHD" || stage.resourceKey === "CHARGING_CREW") {
+    return stage.resourceKey;
+  }
+  return inferResourceKey(String(stage.id ?? ""));
+}
+
+function getCapacityFor(key: ResourceKey, options: SimulateOptions): number {
+  const r = options.resources ?? {};
+
+  if (key === "DRILL_RIG") return r.drillRigs ?? 0;
+  if (key === "LHD") return r.lhds ?? 0;
+  if (key === "CHARGING_CREW") return r.chargingCrews ?? 0;
+  if (key === "SUPPORT_CREW") return r.supportCrews ?? 0;
+
+  return 0;
+}
+
+
+
+type Pool = { key: ResourceKey; avail: number[]; busyMin: number };
+
+function ensurePool(pools: Map<ResourceKey, Pool>, key: ResourceKey, options: SimulateOptions) {
+  if (pools.has(key)) return;
+  const cap = getCapacityFor(key, options);
+  if (!Number.isFinite(cap) || cap <= 0) {
+    throw new Error(
+      `No capacity provided for resource ${key}. Set options.resources (e.g., drillRigs/lhds/chargingCrews).`
+    );
+  }
+  pools.set(key, { key, avail: Array.from({ length: cap }, () => 0), busyMin: 0 });
+}
+
+function allocate(pools: Map<ResourceKey, Pool>, key: ResourceKey, options: SimulateOptions, earliest: number) {
+  ensurePool(pools, key, options);
+  const pool = pools.get(key)!;
+
+  // choose unit that becomes available soonest (deterministic)
+  let bestIdx = 0;
+  let bestAvail = pool.avail[0];
+
+  for (let i = 1; i < pool.avail.length; i++) {
+    if (pool.avail[i] < bestAvail) {
+      bestAvail = pool.avail[i];
+      bestIdx = i;
+    }
+  }
+
+  return { start: Math.max(earliest, bestAvail), unitIndex: bestIdx };
+}
+
+function release(pools: Map<ResourceKey, Pool>, key: ResourceKey, unitIndex: number, end: number, busyAdded: number) {
+  const pool = pools.get(key)!;
+  pool.avail[unitIndex] = end;
+  pool.busyMin += busyAdded;
+}
+
+// ---------------- Main simulate ----------------
+
+/** Named export (UI imports this) */
 export function simulateScenario(scenario: Scenario, options: SimulateOptions): SimulationResult {
   assertScenario(scenario);
 
@@ -158,76 +319,124 @@ export function simulateScenario(scenario: Scenario, options: SimulateOptions): 
   const horizonMin = simDays * MIN_PER_DAY;
   const shiftMinutes = hoursPerShift * MIN_PER_HOUR;
 
-  // Per heading clock + blast constraint
+  const runs: StageRun[] = [];
+
+  const pools = new Map<ResourceKey, Pool>();
+
+  // Per-heading time + blast constraint
   const headingTime: number[] = Array.from({ length: scenario.headings }, () => 0);
   const headingReentryAllowedAt: number[] = Array.from({ length: scenario.headings }, () => 0);
 
-  const runs: StageRun[] = [];
+  // Per-heading progress through rounds/stages
+  const headingRoundIndex: number[] = Array.from({ length: scenario.headings }, () => 0);
+  const headingStageIndex: number[] = Array.from({ length: scenario.headings }, () => 0);
 
   const roundDur = totalRoundDuration(scenario.stages);
   let roundsCompletedTotal = 0;
 
-  for (let h = 0; h < scenario.headings; h++) {
-    let roundIndex = 0;
+  // Global dispatcher loop: always schedule the earliest-feasible next stage across all headings.
+  while (true) {
+    let best:
+      | null
+      | {
+          headingIndex: number;
+          stageIndex: number;
+          stage: Stage;
+          startMin: number;
+          resourceKey: ResourceKey | null;
+          resourceUnitIndex?: number;
+        } = null;
 
-    while (true) {
+    for (let h = 0; h < scenario.headings; h++) {
+      const si = headingStageIndex[h];
+      const st = scenario.stages[si];
+      if (!st) continue;
+
       // Earliest possible time considering lockouts
       let t = Math.max(headingTime[h], headingReentryAllowedAt[h]);
 
-      // ✅ Option 1: Always respect shift schedule; policy only affects *how* we pick the start time.
-      t = roundStartTime(t, scenario, shiftMinutes);
+      // Policy applies only at start of a round; otherwise we just normalize to working time.
+      if (si === 0) t = roundStartTime(t, scenario, shiftMinutes);
+      else t = normalizeToWorkingTime(t, shiftMinutes, scenario.shiftsPerDay);
 
-      // Stop if we can't start within horizon
-      if (t >= horizonMin) break;
+      if (t >= horizonMin) continue;
 
-      // Conservative: if the full round can't fit in remaining horizon, stop
-      if (t + roundDur > horizonMin) break;
+      // Resource constraint (if stage requires one)
+      const rKey = getStageResourceKey(st);
+      let unitIndex: number | undefined = undefined;
 
-      // Execute stages sequentially
-      for (const st of scenario.stages) {
-        // Respect blast lockouts
-        t = Math.max(t, headingReentryAllowedAt[h]);
-
-        // ✅ Option 1: Both policies only work during scheduled shifts
-        // and stages cannot straddle shift end (defer whole stage).
-        t = fitStageIntoShift(t, st.durationMin, shiftMinutes, scenario.shiftsPerDay);
-
-        const startMin = t;
-        const endMin = startMin + st.durationMin;
-
-        if (endMin > horizonMin) {
-          // No partials
-          t = horizonMin;
-          break;
-        }
-
-        if (recordRuns) {
-          runs.push({
-            headingIndex: h,
-            roundIndex,
-            stageId: st.id,
-            stageName: st.name,
-            startMin,
-            endMin,
-            meta: st.isBlast ? { isBlast: true } : undefined,
-          });
-        }
-
-        if (st.isBlast) {
-          const lockout = scenario.reEntryDelayMin + scenario.blastLockoutMin;
-          headingReentryAllowedAt[h] = Math.max(headingReentryAllowedAt[h], endMin + lockout);
-        }
-
-        t = endMin;
+      if (rKey) {
+        const alloc = allocate(pools, rKey, options, t);
+        t = alloc.start;
+        unitIndex = alloc.unitIndex;
       }
 
-      // Round completed
-      headingTime[h] = t;
+      // Enforce shift rule: no straddling shift end, no off-shift work
+      t = fitStageIntoShift(t, st.durationMin, shiftMinutes, scenario.shiftsPerDay);
+
+      // Check horizon feasibility
+      if (t >= horizonMin) continue;
+      if (t + st.durationMin > horizonMin) continue;
+
+      if (!best || t < best.startMin) {
+        best = {
+          headingIndex: h,
+          stageIndex: si,
+          stage: st,
+          startMin: t,
+          resourceKey: rKey,
+          resourceUnitIndex: unitIndex,
+        };
+      }
+    }
+
+    if (!best) break;
+
+    const h = best.headingIndex;
+    const st = best.stage;
+    const startMin = best.startMin;
+    const endMin = startMin + st.durationMin;
+
+    if (recordRuns) {
+      runs.push({
+        headingIndex: h,
+        roundIndex: headingRoundIndex[h],
+        stageId: st.id,
+        stageName: st.name,
+        startMin,
+        endMin,
+        meta: {
+          isBlast: !!st.isBlast,
+          resourceKey: best.resourceKey ?? undefined,
+          resourceUnitIndex: best.resourceUnitIndex,
+        },
+      });
+    }
+
+    // Reserve resource unit until stage completes
+    if (best.resourceKey && best.resourceUnitIndex != null) {
+      release(pools, best.resourceKey, best.resourceUnitIndex, endMin, st.durationMin);
+    }
+
+    // Blast lockout updates
+    if (st.isBlast) {
+      const lockout = scenario.reEntryDelayMin + scenario.blastLockoutMin;
+      headingReentryAllowedAt[h] = Math.max(headingReentryAllowedAt[h], endMin + lockout);
+    }
+
+    // Advance heading clocks/progress
+    headingTime[h] = endMin;
+    headingStageIndex[h] += 1;
+
+    // If completed all stages, round done
+    if (headingStageIndex[h] >= scenario.stages.length) {
+      headingStageIndex[h] = 0;
+      headingRoundIndex[h] += 1;
       roundsCompletedTotal += 1;
-      roundIndex += 1;
     }
   }
 
+  // KPIs
   const roundsCompletedPerHeading = roundsCompletedTotal / scenario.headings;
   const metresAdvancedTotal = roundsCompletedTotal * scenario.advancePerRoundM;
   const metresAdvancedPerHeading = metresAdvancedTotal / scenario.headings;
@@ -235,14 +444,35 @@ export function simulateScenario(scenario: Scenario, options: SimulateOptions): 
   const roundsPerDayTotal = roundsCompletedTotal / simDays;
   const metresPerDayTotal = metresAdvancedTotal / simDays;
 
-  // Available time per heading is only the scheduled shift minutes (not full 24h if off-shift exists)
+  // Available time per heading is only scheduled shift minutes
   const availableMinPerHeading = simDays * scenario.shiftsPerDay * shiftMinutes;
 
-  // Busy time approximated as (rounds per heading) * (sum stage durations)
-  const busyMinPerHeading = roundsCompletedPerHeading * roundDur;
+  // Busy time per heading (sum of that heading's run durations)
+  const busyMinPerHeadingArr: number[] = Array.from({ length: scenario.headings }, () => 0);
+  for (const r of runs) {
+    const dur = (r.endMin ?? 0) - (r.startMin ?? 0);
+    if (dur > 0) busyMinPerHeadingArr[r.headingIndex] += dur;
+  }
 
   const headingUtilization =
-    availableMinPerHeading > 0 ? Math.min(1, Math.max(0, busyMinPerHeading / availableMinPerHeading)) : 0;
+    availableMinPerHeading > 0
+      ? busyMinPerHeadingArr.reduce((a, b) => a + Math.min(1, Math.max(0, b / availableMinPerHeading)), 0) /
+        scenario.headings
+      : 0;
+
+  // Resource utilization outputs
+  const resourceUtilization: ResourceUtilization[] = Array.from(pools.values()).map((p) => {
+    const cap = p.avail.length;
+    const availableMinTotal = simDays * scenario.shiftsPerDay * shiftMinutes * cap;
+    const util = availableMinTotal > 0 ? Math.min(1, Math.max(0, p.busyMin / availableMinTotal)) : 0;
+    return {
+      resourceKey: p.key,
+      units: cap,
+      busyMin: p.busyMin,
+      availableMin: availableMinTotal,
+      utilization: util,
+    };
+  });
 
   return {
     scenarioName: scenario.name,
@@ -250,6 +480,7 @@ export function simulateScenario(scenario: Scenario, options: SimulateOptions): 
     minutesPerDay: MIN_PER_DAY,
     shiftMinutes,
     runs,
+    resourceUtilization,
     kpis: {
       simDays,
       roundsCompletedTotal,
