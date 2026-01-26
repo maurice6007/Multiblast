@@ -1,21 +1,41 @@
-import type { Scenario } from "./types";
+// src/models/defaultScenario.ts
+
+export type BlastTiming = "midshift" | "endOfShift";
+
+export interface Scenario {
+  simDays: number;
+  tickMin: number;
+
+  headings: number;
+  metresPerRound: number;
+
+  shift: {
+    shiftDurationMin: number;
+    blastTiming: BlastTiming;
+  };
+
+  durations: {
+    drill: number;
+    charge: number;
+    muck: number;
+  };
+}
 
 export const defaultScenario: Scenario = {
-  name: "Base Case",
-  headings: 4,
-  shiftsPerDay: 3,
-  advancePerRoundM: 4.0,
+  simDays: 30,
+  tickMin: 5,
 
-  policy: "IMMEDIATE",
+  headings: 2,
+  metresPerRound: 3.8,
 
-  reEntryDelayMin: 30,
-  blastLockoutMin: 60,
+  shift: {
+    shiftDurationMin: 720,
+    blastTiming: "endOfShift",
+  },
 
-  stages: [
-    { id: "drill", name: "Drill", durationMin: 180 },
-    { id: "charge", name: "Charge", durationMin: 60 },
-    { id: "blast", name: "Blast", durationMin: 1, isBlast: true },
-    { id: "muck", name: "Muck", durationMin: 240 },
-    { id: "support", name: "Support", durationMin: 120 },
-  ],
+  durations: {
+    drill: 180,
+    charge: 60,
+    muck: 240,
+  },
 };

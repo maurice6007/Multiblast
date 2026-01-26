@@ -1,495 +1,326 @@
-// src/engine/simulate.ts
-// Deterministic shift-aware, blast-lockout-aware simulator with shared (contention) resources.
-// Resources are shared across headings and cannot work simultaneously on multiple headings.
+// src/sim/simulate.ts
+// Clean, deterministic simulation with blast timing:
+// - "midshift"  => Immediate (as soon as ready)
+// - "endOfShift" => Fire at end of current shift
+//
+// NOTE: "midshift" = blast immediately when ready (NOT middle of shift)
 
-export type Policy = "END_OF_SHIFT_ONLY" | "IMMEDIATE";
+export type BlastTiming = "midshift" | "endOfShift";
 
-export interface Stage {
-  id: string;
-  name: string;
-  durationMin: number;
-  isBlast?: boolean;
+export interface ShiftConfig {
+  shiftDurationMin: number; // e.g. 720 for 12h
+  blastTiming: BlastTiming;
+}
 
-  /**
-   * Optional explicit resource mapping. If omitted, we infer from stage.id:
-   *  - contains "DRILL"  -> DRILL_RIG
-   *  - contains "MUCK"   -> LHD
-   *  - contains "CHARGE" -> CHARGING_CREW
-   */
-  resourceKey?: ResourceKey;
+export interface RoundDurationsMin {
+  drill: number;
+  charge: number;
+  muck: number;
+  // Optional extra fixed delays you may want later:
+  // ventReentry: number;
 }
 
 export interface Scenario {
-  name: string;
-  policy: Policy;
-
+  simDays: number;
+  tickMin: number; // recommended 1, 5, or 10
   headings: number;
-  shiftsPerDay: number;
-  advancePerRoundM: number;
 
-  reEntryDelayMin: number;
-  blastLockoutMin: number;
+  metresPerRound: number;
 
-  stages: Stage[];
+  shift: ShiftConfig;
+  durations: RoundDurationsMin;
 }
 
-export interface StageRun {
-  headingIndex: number;
-  roundIndex: number;
-  stageId: string;
-  stageName: string;
-  startMin: number;
-  endMin: number;
-  meta?: { isBlast?: boolean; resourceKey?: ResourceKey; resourceUnitIndex?: number };
-}
-
-export interface ResourceUtilization {
-  resourceKey: ResourceKey;
-  units: number;
-  busyMin: number;
-  availableMin: number;
-  utilization: number; // 0..1
-}
-
-export interface SimulationResult {
-  scenarioName: string;
-  policy: Policy;
-  minutesPerDay: number;
-  shiftMinutes: number;
-  runs: StageRun[];
-  resourceUtilization: ResourceUtilization[];
-  kpis: {
-    simDays: number;
-
-    roundsCompletedTotal: number;
-    roundsCompletedPerHeading: number;
-
-    metresAdvancedTotal: number;
-    metresAdvancedPerHeading: number;
-
-    roundsPerDayTotal: number;
-    metresPerDayTotal: number;
-
-    headingUtilization: number; // average across headings based on scheduled minutes
-  };
-}
-
-export type ResourceKey =
-  | "DRILL_RIG"
-  | "LHD"
-  | "CHARGING_CREW"
-  | "SUPPORT_CREW";
-
-
-export interface SimulateOptions {
-  /** Simulation horizon in days. Deterministic: same inputs => same outputs. */
+export interface SimulationKpis {
   simDays: number;
 
-  /** Scheduled hours per shift. Default 8. */
-  hoursPerShift?: number;
+  roundsCompletedTotal: number;
+  roundsCompletedPerHeading: number;
 
-  /** If true, record every StageRun event. Default true. */
-  recordRuns?: boolean;
+  metresAdvancedTotal: number;
+  metresAdvancedPerHeading: number;
 
-  /**
-   * Shared resources across headings. If a stage requires a resource and capacity is missing/0, we throw.
-   * Stages infer requirements by stage.id unless stage.resourceKey is set explicitly.
-   */
-  resources?: {
-  drillRigs?: number;
-  lhds?: number;
-  chargingCrews?: number;
-  supportCrews?: number;
-};
+  roundsPerDayTotal: number;
+  metresPerDayTotal: number;
 
+  headingUtilization: number; // busy time / total time per heading
 }
 
-const MIN_PER_HOUR = 60;
-const MIN_PER_DAY = 24 * MIN_PER_HOUR;
+type Stage = "DRILL" | "CHARGE" | "BLAST_READY" | "WAITING_FOR_BLAST" | "MUCK";
 
-function assertScenario(s: Scenario): void {
-  if (!s.name) throw new Error("Scenario.name is required");
-  if (!Number.isFinite(s.headings) || s.headings <= 0) throw new Error("Scenario.headings must be > 0");
-  if (!Number.isFinite(s.shiftsPerDay) || s.shiftsPerDay <= 0) throw new Error("Scenario.shiftsPerDay must be > 0");
-  if (!Number.isFinite(s.advancePerRoundM) || s.advancePerRoundM <= 0) throw new Error("Scenario.advancePerRoundM must be > 0");
-  if (!Array.isArray(s.stages) || s.stages.length === 0) throw new Error("Scenario.stages must be a non-empty array");
-  for (const st of s.stages) {
-    if (!st.id) throw new Error("Stage.id is required");
-    if (!st.name) throw new Error("Stage.name is required");
-    if (!Number.isFinite(st.durationMin) || st.durationMin <= 0) {
-      throw new Error(`Stage.durationMin must be > 0 (stage ${st.id})`);
-    }
-  }
-  if (!Number.isFinite(s.reEntryDelayMin) || s.reEntryDelayMin < 0) throw new Error("Scenario.reEntryDelayMin must be >= 0");
-  if (!Number.isFinite(s.blastLockoutMin) || s.blastLockoutMin < 0) throw new Error("Scenario.blastLockoutMin must be >= 0");
+interface HeadingState {
+  id: string;
+  stage: Stage;
+  remainingMin: number; // remaining time in current stage (if applicable)
+  busyMin: number; // accumulated "working" minutes (utilization numerator)
+  roundsCompleted: number;
+  metresAdvanced: number;
 }
 
-function totalRoundDuration(stages: Stage[]): number {
-  return stages.reduce((sum, st) => sum + st.durationMin, 0);
+interface PendingBlast {
+  headingId: string;
+  scheduledAtMin: number;
 }
 
-/**
- * Shift calendar helpers:
- * - Shifts start at day boundary (t=0) and repeat each day.
- * - Within a day, shifts occupy [0, shiftsPerDay*shiftMinutes). Any remaining time is off-shift.
- */
-function dayIndex(tMin: number): number {
-  return Math.floor(tMin / MIN_PER_DAY);
-}
+export function simulate(s: Scenario): SimulationKpis {
+  validateScenario(s);
 
-function withinDay(tMin: number): number {
-  return tMin - dayIndex(tMin) * MIN_PER_DAY;
-}
+  const simMinutes = s.simDays * 24 * 60;
+  const tickMin = s.tickMin;
 
-function shiftIndexWithinDay(within: number, shiftMinutes: number): number {
-  return Math.floor(within / shiftMinutes);
-}
+  const headings: HeadingState[] = Array.from({ length: s.headings }, (_, i) =>
+    newHeading(`H${i + 1}`, s)
+  );
 
-function isWithinScheduledShifts(within: number, shiftMinutes: number, shiftsPerDay: number): boolean {
-  return within >= 0 && within < shiftsPerDay * shiftMinutes;
-}
+  const pendingBlasts: PendingBlast[] = [];
 
-function shiftEndTime(tMin: number, shiftMinutes: number, shiftsPerDay: number): number {
-  const d = dayIndex(tMin);
-  const w = withinDay(tMin);
+  for (let nowMin = 0; nowMin < simMinutes; nowMin += tickMin) {
+    // 1) Fire any pending end-of-shift blasts that are due
+    executePendingBlasts(nowMin, pendingBlasts, headings, s);
 
-  if (!isWithinScheduledShifts(w, shiftMinutes, shiftsPerDay)) {
-    // If outside scheduled shifts, "end" is next day's first shift end (we won't work here anyway)
-    return (d + 1) * MIN_PER_DAY + shiftMinutes;
-  }
-
-  const si = shiftIndexWithinDay(w, shiftMinutes);
-  return d * MIN_PER_DAY + (si + 1) * shiftMinutes;
-}
-
-/** Next shift boundary at or after tMin (if already on boundary, returns tMin). */
-function nextShiftBoundary(tMin: number, shiftMinutes: number, shiftsPerDay: number): number {
-  const d = dayIndex(tMin);
-  const w = withinDay(tMin);
-
-  // Outside scheduled shifts => next day's first shift start
-  if (!isWithinScheduledShifts(w, shiftMinutes, shiftsPerDay)) {
-    return (d + 1) * MIN_PER_DAY;
-  }
-
-  const si = shiftIndexWithinDay(w, shiftMinutes);
-  const start = d * MIN_PER_DAY + si * shiftMinutes;
-
-  if (tMin === start) return tMin;
-
-  const next = start + shiftMinutes;
-  // If next boundary exceeds the last scheduled shift, jump to next day
-  if (withinDay(next) >= shiftsPerDay * shiftMinutes) {
-    return (d + 1) * MIN_PER_DAY;
-  }
-  return next;
-}
-
-/** If tMin is in off-shift, push to next day's first shift start. */
-function normalizeToWorkingTime(tMin: number, shiftMinutes: number, shiftsPerDay: number): number {
-  const d = dayIndex(tMin);
-  const w = withinDay(tMin);
-
-  if (isWithinScheduledShifts(w, shiftMinutes, shiftsPerDay)) return tMin;
-
-  return (d + 1) * MIN_PER_DAY;
-}
-
-/**
- * Fit a stage start into the current shift:
- * - If stage fits fully before shift end, keep tMin.
- * - Otherwise defer stage to the next shift boundary (no partial-stage work).
- */
-function fitStageIntoShift(
-  tMin: number,
-  durationMin: number,
-  shiftMinutes: number,
-  shiftsPerDay: number
-): number {
-  tMin = normalizeToWorkingTime(tMin, shiftMinutes, shiftsPerDay);
-  const end = tMin + durationMin;
-  const shiftEnd = shiftEndTime(tMin, shiftMinutes, shiftsPerDay);
-
-  if (end <= shiftEnd) return tMin;
-
-  // Defer whole stage to next shift boundary
-  return nextShiftBoundary(shiftEnd, shiftMinutes, shiftsPerDay);
-}
-
-/**
- * Policy meaning:
- * - END_OF_SHIFT_ONLY: rounds can only start at shift boundary.
- * - IMMEDIATE: rounds can start any time within working time.
- * Both policies: work only during scheduled shifts.
- */
-function roundStartTime(tProposed: number, scenario: Scenario, shiftMinutes: number): number {
-  const tWorking = normalizeToWorkingTime(tProposed, shiftMinutes, scenario.shiftsPerDay);
-
-  if (scenario.policy === "END_OF_SHIFT_ONLY") {
-    return nextShiftBoundary(tWorking, shiftMinutes, scenario.shiftsPerDay);
-  }
-
-  // IMMEDIATE (within shifts)
-  return tWorking;
-}
-
-// ---------------- Resource mapping + pool ----------------
-
-function inferResourceKey(stageId: string): ResourceKey | null {
-  const s = stageId.toUpperCase();
-  if (s.includes("DRILL")) return "DRILL_RIG";
-  if (s.includes("MUCK") || s.includes("LHD")) return "LHD";
-  if (s.includes("CHARGE")) return "CHARGING_CREW";
-  if (s.includes("SUPPORT") || s.includes("BOLT") || s.includes("SHOT")) return "SUPPORT_CREW";
-  return null;
-}
-
-
-function getStageResourceKey(stage: Stage): ResourceKey | null {
-  if (stage.resourceKey === "DRILL_RIG" || stage.resourceKey === "LHD" || stage.resourceKey === "CHARGING_CREW") {
-    return stage.resourceKey;
-  }
-  return inferResourceKey(String(stage.id ?? ""));
-}
-
-function getCapacityFor(key: ResourceKey, options: SimulateOptions): number {
-  const r = options.resources ?? {};
-
-  if (key === "DRILL_RIG") return r.drillRigs ?? 0;
-  if (key === "LHD") return r.lhds ?? 0;
-  if (key === "CHARGING_CREW") return r.chargingCrews ?? 0;
-  if (key === "SUPPORT_CREW") return r.supportCrews ?? 0;
-
-  return 0;
-}
-
-
-
-type Pool = { key: ResourceKey; avail: number[]; busyMin: number };
-
-function ensurePool(pools: Map<ResourceKey, Pool>, key: ResourceKey, options: SimulateOptions) {
-  if (pools.has(key)) return;
-  const cap = getCapacityFor(key, options);
-  if (!Number.isFinite(cap) || cap <= 0) {
-    throw new Error(
-      `No capacity provided for resource ${key}. Set options.resources (e.g., drillRigs/lhds/chargingCrews).`
-    );
-  }
-  pools.set(key, { key, avail: Array.from({ length: cap }, () => 0), busyMin: 0 });
-}
-
-function allocate(pools: Map<ResourceKey, Pool>, key: ResourceKey, options: SimulateOptions, earliest: number) {
-  ensurePool(pools, key, options);
-  const pool = pools.get(key)!;
-
-  // choose unit that becomes available soonest (deterministic)
-  let bestIdx = 0;
-  let bestAvail = pool.avail[0];
-
-  for (let i = 1; i < pool.avail.length; i++) {
-    if (pool.avail[i] < bestAvail) {
-      bestAvail = pool.avail[i];
-      bestIdx = i;
+    // 2) Advance each heading by one tick
+    for (const h of headings) {
+      advanceHeadingByTick(h, nowMin, tickMin, pendingBlasts, s);
     }
   }
 
-  return { start: Math.max(earliest, bestAvail), unitIndex: bestIdx };
+  const kpis = computeKpis(headings, s, simMinutes);
+assertSimulationProgress(kpis, s);
+return kpis;
+
+
+/* ----------------------------- Core behavior ----------------------------- */
+
+function advanceHeadingByTick(
+  h: HeadingState,
+  nowMin: number,
+  tickMin: number,
+  pendingBlasts: PendingBlast[],
+  s: Scenario
+) {
+  // Count utilization only when actively doing work (drill/charge/muck).
+  const isWorking =
+    h.stage === "DRILL" || h.stage === "CHARGE" || h.stage === "MUCK";
+
+  if (isWorking) h.busyMin += tickMin;
+
+  // If we're in BLAST_READY, handle blast timing gate once, then move on.
+  if (h.stage === "BLAST_READY") {
+    onBlastReady(h, nowMin, pendingBlasts, s);
+    // After onBlastReady, stage will be MUCK (immediate blast) or WAITING_FOR_BLAST
+    return;
+  }
+
+  // WAITING_FOR_BLAST does nothing until a scheduled blast fires.
+  if (h.stage === "WAITING_FOR_BLAST") return;
+
+  // DRILL / CHARGE / MUCK: decrement remaining and transition when done.
+  if (h.remainingMin > 0) {
+    h.remainingMin = Math.max(0, h.remainingMin - tickMin);
+  }
+
+  if (h.remainingMin > 0) return;
+
+  // Transition on completion
+  switch (h.stage) {
+    case "DRILL":
+      h.stage = "CHARGE";
+      h.remainingMin = s.durations.charge;
+      break;
+
+    case "CHARGE":
+      h.stage = "BLAST_READY";
+      h.remainingMin = 0;
+      // BLAST_READY will be handled next tick (or immediately if you prefer;
+      // but doing it here can cause re-entrancy. Keeping it in next tick is safer.)
+      break;
+
+    case "MUCK":
+      // Round completes at end of mucking
+      completeRound(h, s);
+      // Start next round
+      h.stage = "DRILL";
+      h.remainingMin = s.durations.drill;
+      break;
+
+    default:
+      // no-op
+      break;
+  }
 }
 
-function release(pools: Map<ResourceKey, Pool>, key: ResourceKey, unitIndex: number, end: number, busyAdded: number) {
-  const pool = pools.get(key)!;
-  pool.avail[unitIndex] = end;
-  pool.busyMin += busyAdded;
+function onBlastReady(
+  h: HeadingState,
+  nowMin: number,
+  pendingBlasts: PendingBlast[],
+  s: Scenario
+) {
+  if (s.shift.blastTiming === "midshift") {
+    // Immediate (as soon as ready)
+    doBlast(h, s);
+    return;
+  }
+
+  // End of shift: hold until shift end
+  const shiftEnd = shiftEndMin(nowMin, s.shift.shiftDurationMin);
+
+  // Avoid duplicate scheduling if BLAST_READY is revisited
+  const exists = pendingBlasts.some((b) => b.headingId === h.id);
+  if (!exists) pendingBlasts.push({ headingId: h.id, scheduledAtMin: shiftEnd });
+
+  // Move into explicit waiting state so the rest of the sim doesn't treat it as active work
+  h.stage = "WAITING_FOR_BLAST";
+  h.remainingMin = 0;
 }
 
-// ---------------- Main simulate ----------------
+function executePendingBlasts(
+  nowMin: number,
+  pendingBlasts: PendingBlast[],
+  headings: HeadingState[],
+  s: Scenario
+) {
+  if (pendingBlasts.length === 0) return;
 
-/** Named export (UI imports this) */
-export function simulateScenario(scenario: Scenario, options: SimulateOptions): SimulationResult {
-  assertScenario(scenario);
+  // Fire all blasts that are due
+  const due: PendingBlast[] = [];
+  for (const b of pendingBlasts) {
+    if (b.scheduledAtMin <= nowMin) due.push(b);
+  }
+  if (due.length === 0) return;
 
-  const simDays = options.simDays;
-  if (!Number.isFinite(simDays) || simDays <= 0) throw new Error("options.simDays must be > 0");
+  for (const b of due) {
+    const h = headings.find((x) => x.id === b.headingId);
+    if (!h) continue;
 
-  const hoursPerShift = options.hoursPerShift ?? 8;
-  if (!Number.isFinite(hoursPerShift) || hoursPerShift <= 0) throw new Error("options.hoursPerShift must be > 0");
-
-  const recordRuns = options.recordRuns ?? true;
-
-  const horizonMin = simDays * MIN_PER_DAY;
-  const shiftMinutes = hoursPerShift * MIN_PER_HOUR;
-
-  const runs: StageRun[] = [];
-
-  const pools = new Map<ResourceKey, Pool>();
-
-  // Per-heading time + blast constraint
-  const headingTime: number[] = Array.from({ length: scenario.headings }, () => 0);
-  const headingReentryAllowedAt: number[] = Array.from({ length: scenario.headings }, () => 0);
-
-  // Per-heading progress through rounds/stages
-  const headingRoundIndex: number[] = Array.from({ length: scenario.headings }, () => 0);
-  const headingStageIndex: number[] = Array.from({ length: scenario.headings }, () => 0);
-
-  const roundDur = totalRoundDuration(scenario.stages);
-  let roundsCompletedTotal = 0;
-
-  // Global dispatcher loop: always schedule the earliest-feasible next stage across all headings.
-  while (true) {
-    let best:
-      | null
-      | {
-          headingIndex: number;
-          stageIndex: number;
-          stage: Stage;
-          startMin: number;
-          resourceKey: ResourceKey | null;
-          resourceUnitIndex?: number;
-        } = null;
-
-    for (let h = 0; h < scenario.headings; h++) {
-      const si = headingStageIndex[h];
-      const st = scenario.stages[si];
-      if (!st) continue;
-
-      // Earliest possible time considering lockouts
-      let t = Math.max(headingTime[h], headingReentryAllowedAt[h]);
-
-      // Policy applies only at start of a round; otherwise we just normalize to working time.
-      if (si === 0) t = roundStartTime(t, scenario, shiftMinutes);
-      else t = normalizeToWorkingTime(t, shiftMinutes, scenario.shiftsPerDay);
-
-      if (t >= horizonMin) continue;
-
-      // Resource constraint (if stage requires one)
-      const rKey = getStageResourceKey(st);
-      let unitIndex: number | undefined = undefined;
-
-      if (rKey) {
-        const alloc = allocate(pools, rKey, options, t);
-        t = alloc.start;
-        unitIndex = alloc.unitIndex;
-      }
-
-      // Enforce shift rule: no straddling shift end, no off-shift work
-      t = fitStageIntoShift(t, st.durationMin, shiftMinutes, scenario.shiftsPerDay);
-
-      // Check horizon feasibility
-      if (t >= horizonMin) continue;
-      if (t + st.durationMin > horizonMin) continue;
-
-      if (!best || t < best.startMin) {
-        best = {
-          headingIndex: h,
-          stageIndex: si,
-          stage: st,
-          startMin: t,
-          resourceKey: rKey,
-          resourceUnitIndex: unitIndex,
-        };
-      }
-    }
-
-    if (!best) break;
-
-    const h = best.headingIndex;
-    const st = best.stage;
-    const startMin = best.startMin;
-    const endMin = startMin + st.durationMin;
-
-    if (recordRuns) {
-      runs.push({
-        headingIndex: h,
-        roundIndex: headingRoundIndex[h],
-        stageId: st.id,
-        stageName: st.name,
-        startMin,
-        endMin,
-        meta: {
-          isBlast: !!st.isBlast,
-          resourceKey: best.resourceKey ?? undefined,
-          resourceUnitIndex: best.resourceUnitIndex,
-        },
-      });
-    }
-
-    // Reserve resource unit until stage completes
-    if (best.resourceKey && best.resourceUnitIndex != null) {
-      release(pools, best.resourceKey, best.resourceUnitIndex, endMin, st.durationMin);
-    }
-
-    // Blast lockout updates
-    if (st.isBlast) {
-      const lockout = scenario.reEntryDelayMin + scenario.blastLockoutMin;
-      headingReentryAllowedAt[h] = Math.max(headingReentryAllowedAt[h], endMin + lockout);
-    }
-
-    // Advance heading clocks/progress
-    headingTime[h] = endMin;
-    headingStageIndex[h] += 1;
-
-    // If completed all stages, round done
-    if (headingStageIndex[h] >= scenario.stages.length) {
-      headingStageIndex[h] = 0;
-      headingRoundIndex[h] += 1;
-      roundsCompletedTotal += 1;
+    // Only fire if still waiting; if state changed, ignore
+    if (h.stage === "WAITING_FOR_BLAST") {
+      doBlast(h, s);
     }
   }
 
-  // KPIs
-  const roundsCompletedPerHeading = roundsCompletedTotal / scenario.headings;
-  const metresAdvancedTotal = roundsCompletedTotal * scenario.advancePerRoundM;
-  const metresAdvancedPerHeading = metresAdvancedTotal / scenario.headings;
-
-  const roundsPerDayTotal = roundsCompletedTotal / simDays;
-  const metresPerDayTotal = metresAdvancedTotal / simDays;
-
-  // Available time per heading is only scheduled shift minutes
-  const availableMinPerHeading = simDays * scenario.shiftsPerDay * shiftMinutes;
-
-  // Busy time per heading (sum of that heading's run durations)
-  const busyMinPerHeadingArr: number[] = Array.from({ length: scenario.headings }, () => 0);
-  for (const r of runs) {
-    const dur = (r.endMin ?? 0) - (r.startMin ?? 0);
-    if (dur > 0) busyMinPerHeadingArr[r.headingIndex] += dur;
+  // Remove fired/expired
+  for (const b of due) {
+    const idx = pendingBlasts.findIndex((x) => x.headingId === b.headingId);
+    if (idx >= 0) pendingBlasts.splice(idx, 1);
   }
+}
 
-  const headingUtilization =
-    availableMinPerHeading > 0
-      ? busyMinPerHeadingArr.reduce((a, b) => a + Math.min(1, Math.max(0, b / availableMinPerHeading)), 0) /
-        scenario.headings
+function doBlast(h: HeadingState, s: Scenario) {
+  // Blast itself is instantaneous in this clean version.
+  // If you later model blast window, venting, re-entry etc, insert stage(s) here.
+  h.stage = "MUCK";
+  h.remainingMin = s.durations.muck;
+}
+
+function completeRound(h: HeadingState, s: Scenario) {
+  h.roundsCompleted += 1;
+  h.metresAdvanced += s.metresPerRound;
+}
+
+/* ----------------------------- KPIs & helpers ---------------------------- */
+
+function computeKpis(
+  headings: HeadingState[],
+  s: Scenario,
+  simMinutes: number
+): SimulationKpis {
+  const totalRounds = headings.reduce((acc, h) => acc + h.roundsCompleted, 0);
+  const totalMetres = headings.reduce((acc, h) => acc + h.metresAdvanced, 0);
+
+  const roundsPerHeading = s.headings > 0 ? totalRounds / s.headings : 0;
+  const metresPerHeading = s.headings > 0 ? totalMetres / s.headings : 0;
+
+  const roundsPerDayTotal = s.simDays > 0 ? totalRounds / s.simDays : 0;
+  const metresPerDayTotal = s.simDays > 0 ? totalMetres / s.simDays : 0;
+
+  // Utilization: average busy% per heading
+  const utilAvg =
+    s.headings > 0
+      ? headings.reduce((acc, h) => acc + h.busyMin / simMinutes, 0) / s.headings
       : 0;
 
-  // Resource utilization outputs
-  const resourceUtilization: ResourceUtilization[] = Array.from(pools.values()).map((p) => {
-    const cap = p.avail.length;
-    const availableMinTotal = simDays * scenario.shiftsPerDay * shiftMinutes * cap;
-    const util = availableMinTotal > 0 ? Math.min(1, Math.max(0, p.busyMin / availableMinTotal)) : 0;
-    return {
-      resourceKey: p.key,
-      units: cap,
-      busyMin: p.busyMin,
-      availableMin: availableMinTotal,
-      utilization: util,
-    };
-  });
-
   return {
-    scenarioName: scenario.name,
-    policy: scenario.policy,
-    minutesPerDay: MIN_PER_DAY,
-    shiftMinutes,
-    runs,
-    resourceUtilization,
-    kpis: {
-      simDays,
-      roundsCompletedTotal,
-      roundsCompletedPerHeading,
-      metresAdvancedTotal,
-      metresAdvancedPerHeading,
-      roundsPerDayTotal,
-      metresPerDayTotal,
-      headingUtilization,
-    },
+    simDays: s.simDays,
+
+    roundsCompletedTotal: totalRounds,
+    roundsCompletedPerHeading: roundsPerHeading,
+
+    metresAdvancedTotal: totalMetres,
+    metresAdvancedPerHeading: metresPerHeading,
+
+    roundsPerDayTotal,
+    metresPerDayTotal,
+
+    headingUtilization: utilAvg,
   };
+}
+
+function newHeading(id: string, s: Scenario): HeadingState {
+  return {
+    id,
+    stage: "DRILL",
+    remainingMin: s.durations.drill,
+    busyMin: 0,
+    roundsCompleted: 0,
+    metresAdvanced: 0,
+  };
+}
+
+function shiftStartMin(nowMin: number, shiftDurationMin: number): number {
+  return Math.floor(nowMin / shiftDurationMin) * shiftDurationMin;
+}
+
+function shiftEndMin(nowMin: number, shiftDurationMin: number): number {
+  return shiftStartMin(nowMin, shiftDurationMin) + shiftDurationMin;
+}
+
+function validateScenario(s: Scenario) {
+  if (s.simDays <= 0) throw new Error("simDays must be > 0");
+  if (s.tickMin <= 0) throw new Error("tickMin must be > 0");
+  if (s.headings <= 0) throw new Error("headings must be > 0");
+  if (s.metresPerRound <= 0) throw new Error("metresPerRound must be > 0");
+
+  if (s.shift.shiftDurationMin <= 0)
+    throw new Error("shift.shiftDurationMin must be > 0");
+
+  if (s.durations.drill < 0 || s.durations.charge < 0 || s.durations.muck < 0)
+    throw new Error("durations must be >= 0");
+
+  if (s.shift.blastTiming !== "midshift" && s.shift.blastTiming !== "endOfShift")
+    throw new Error("shift.blastTiming invalid");
+}
+
+function assertSimulationProgress(kpis: SimulationKpis, s: Scenario) {
+  if (s.simDays >= 1 && kpis.roundsCompletedTotal === 0) {
+    throw new Error(
+      [
+        "Simulation produced zero completed rounds.",
+        "Deadlock or invalid timing configuration.",
+        `blastTiming=${s.shift.blastTiming}`,
+        `headings=${s.headings}`,
+        `durations(drill=${s.durations.drill}, charge=${s.durations.charge}, muck=${s.durations.muck})`,
+        `shiftDurationMin=${s.shift.shiftDurationMin}`,
+        `tickMin=${s.tickMin}`,
+      ].join(" ")
+    );
+  }
+}
+
+
+
+{
+  if (s.simDays >= 1 && kpis.roundsCompletedTotal === 0) {
+    throw new Error(
+      [
+        "Simulation produced zero completed rounds.",
+        "This indicates a deadlock or invalid timing configuration.",
+        `blastTiming=${s.shift.blastTiming}`,
+        `headings=${s.headings}`,
+        `durations(drill=${s.durations.drill}, charge=${s.durations.charge}, muck=${s.durations.muck})`,
+        `shiftDurationMin=${s.shift.shiftDurationMin}`,
+        `tickMin=${s.tickMin}`
+      ].join(" ")
+    );
+  }
+}
 }
