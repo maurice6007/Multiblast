@@ -1,254 +1,604 @@
 // src/ui/DebugSimulationTest.tsx
 import React, { useMemo, useState } from "react";
+import { simulateScenario } from "../engine/simulate";
+import GanttChart from "./GanttChart";
 
-import { defaultScenario as importedDefaultScenario } from "../models/defaultScenario";
-import type { Scenario, BlastTiming } from "../models/defaultScenario";
-import { simulate } from "../engine/simulate";
+function pretty(obj: unknown) {
+  return JSON.stringify(obj, null, 2);
+}
 
-type BlastTimingUiOption = { value: BlastTiming; label: string };
+function safeParseJson(text: string): { ok: true; value: any } | { ok: false; error: string } {
+  try {
+    return { ok: true, value: JSON.parse(text) };
+  } catch (e: any) {
+    return { ok: false, error: e?.message ?? String(e) };
+  }
+}
 
-const BLAST_TIMING_OPTIONS: BlastTimingUiOption[] = [
-  { value: "midshift", label: "Immediate (as soon as ready)" },
-  { value: "endOfShift", label: "End of shift" },
-];
-
-// Adapter so UI never crashes even if scenario shape drifts during refactors
-function normalizeScenario(partial: any): Scenario {
-  const s = partial ?? {};
-  const shift = s.shift ?? {};
-  const durations = s.durations ?? {};
-
-  return {
-    simDays: Number.isFinite(s.simDays) ? s.simDays : 30,
-    tickMin: Number.isFinite(s.tickMin) ? s.tickMin : 5,
-    headings: Number.isFinite(s.headings) ? s.headings : 2,
-    metresPerRound: Number.isFinite(s.metresPerRound) ? s.metresPerRound : 3.8,
-
-    shift: {
-      shiftDurationMin: Number.isFinite(shift.shiftDurationMin) ? shift.shiftDurationMin : 720,
-      blastTiming:
-        shift.blastTiming === "midshift" || shift.blastTiming === "endOfShift"
-          ? shift.blastTiming
-          : "endOfShift",
-    },
-
-    durations: {
-      drill: Number.isFinite(durations.drill) ? durations.drill : 180,
-      charge: Number.isFinite(durations.charge) ? durations.charge : 60,
-      muck: Number.isFinite(durations.muck) ? durations.muck : 240,
-    },
-  };
+function fmt(n: any, digits = 2) {
+  if (typeof n !== "number" || !Number.isFinite(n)) return "—";
+  return n.toLocaleString(undefined, { maximumFractionDigits: digits });
 }
 
 function deepClone<T>(x: T): T {
   return JSON.parse(JSON.stringify(x)) as T;
 }
 
-function Card({ title, children }: { title: string; children: React.ReactNode }) {
+function clampInt(n: any, min = 0, fallback = 0) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return fallback;
+  return Math.max(min, Math.floor(v));
+}
+
+function clampNum(n: any, min = 0, fallback = 0) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return fallback;
+  return Math.max(min, v);
+}
+
+/**
+ * Canonical scenario template (engine shape)
+ */
+const STARTER_SCENARIO: any = {
+  name: "Starter Scenario",
+  headings: 3,
+  simDays: 30,
+  tickMin: 5,
+  metresPerRound: 3.0,
+
+  shift: {
+    shiftDurationMin: 480, // 8 hours
+    blastTiming: "endOfShift", // "midshift" (ASAP) | "endOfShift"
+  },
+
+  durations: {
+    drill: 180,
+    charge: 60,
+    muck: 240,
+    support: 120,
+  },
+
+  resources: {
+    drillRigs: 2,
+    lhds: 1,
+    supportCrews: 1,
+    blastCrews: 1,
+  },
+};
+
+export default function DebugSimulationTest() {
+  const [scenarioText, setScenarioText] = useState<string>(pretty(STARTER_SCENARIO));
+
+  // Run controls
+  const [simDays, setSimDays] = useState<number>(30);
+  const [hoursPerShift, setHoursPerShift] = useState<number>(8); // legacy option used by wrapper (safe to keep)
+  const [recordRuns, setRecordRuns] = useState<boolean>(true);
+
+  // Output
+  const [parseError, setParseError] = useState<string>("");
+  const [runError, setRunError] = useState<string>("");
+  const [result, setResult] = useState<any>(null);
+
+  const parsed = useMemo(() => safeParseJson(scenarioText), [scenarioText]);
+
+  // Canonical object for UI controls even if JSON is malformed
+  const uiScenario = useMemo(() => {
+    if (!parsed.ok) return normalizeScenario(STARTER_SCENARIO);
+    return normalizeScenario(parsed.value);
+  }, [parsed]);
+
+  function patchScenario(patch: (obj: any) => void) {
+    const p = safeParseJson(scenarioText);
+    const base = p.ok ? deepClone(p.value) : deepClone(uiScenario);
+    patch(base);
+    const normalized = normalizeScenario(base);
+    setScenarioText(pretty(normalized));
+  }
+
+  function validateOnly() {
+    setRunError("");
+    setResult(null);
+
+    if (!parsed.ok) {
+      setParseError(parsed.error);
+      return;
+    }
+    setParseError("");
+
+    try {
+      simulateScenario(parsed.value, { simDays: 1, hoursPerShift, recordRuns: false });
+    } catch (e: any) {
+      setRunError(e?.message ?? String(e));
+      return;
+    }
+
+    setRunError("");
+  }
+
+  function onRun() {
+    setRunError("");
+    setResult(null);
+
+    if (!parsed.ok) {
+      setParseError(parsed.error);
+      return;
+    }
+    setParseError("");
+
+    try {
+      const r = simulateScenario(parsed.value, {
+        simDays,
+        hoursPerShift,
+        recordRuns,
+        includeGantt: true,
+      });
+      setResult(r);
+    } catch (e: any) {
+      setRunError(e?.message ?? String(e));
+      console.error(e);
+    }
+  }
+
+  // Result shape: either {kpis, simMinutes, intervals} or legacy KPI-only
+  const kpis = result?.kpis ?? result;
+
+  // Gantt should show ONLY the run window (simDays), stretched to full width
+  const viewMinutes = simDays * 24 * 60;
+
+  const intervalsAll = result?.intervals ?? [];
+  const intervals = useMemo(() => {
+    return intervalsAll
+      .map((seg: any) => {
+        const startMin = Math.max(0, seg.startMin);
+        const endMin = Math.min(viewMinutes, seg.endMin);
+        if (endMin <= startMin) return null;
+        return { ...seg, startMin, endMin };
+      })
+      .filter(Boolean);
+  }, [intervalsAll, viewMinutes]);
+
+  const blastTimingValue =
+    uiScenario.shift.blastTiming === "midshift" || uiScenario.shift.blastTiming === "endOfShift"
+      ? uiScenario.shift.blastTiming
+      : "endOfShift";
+
   return (
-    <div className="rounded-2xl border border-gray-200 bg-white shadow-sm">
-      <div className="border-b border-gray-200 px-5 py-3">
-        <div className="text-sm font-semibold text-gray-900">{title}</div>
+    <div style={{ padding: 16, fontFamily: "system-ui", display: "flex", flexDirection: "column", gap: 14 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <h2 style={{ margin: 0 }}>Simulation Debug UI</h2>
+
+        <button onClick={validateOnly} style={btnStyle}>
+          Validate
+        </button>
+
+        <button onClick={onRun} style={btnStyle}>
+          Run
+        </button>
+
+        <button onClick={() => setScenarioText(pretty(STARTER_SCENARIO))} style={{ ...btnStyle, marginLeft: "auto" }}>
+          Reset template
+        </button>
       </div>
-      <div className="p-5">{children}</div>
+
+      {/* Global run controls */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 10 }}>
+        <Field label="Simrun days">
+          <input type="number" value={simDays} min={1} onChange={(e) => setSimDays(Number(e.target.value))} style={inputStyle} />
+        </Field>
+
+        <Field label="hoursPerShift (legacy)">
+          <input
+            type="number"
+            value={hoursPerShift}
+            min={1}
+            onChange={(e) => setHoursPerShift(Number(e.target.value))}
+            style={inputStyle}
+          />
+        </Field>
+
+        <Field label="Blasting">
+          <select
+            value={blastTimingValue}
+            onChange={(e) =>
+              patchScenario((obj) => {
+                obj.shift = obj.shift ?? {};
+                obj.shift.blastTiming = e.target.value;
+              })
+            }
+            style={inputStyle}
+          >
+            <option value="midshift">ASAP (no delay)</option>
+            <option value="endOfShift">End of shift</option>
+          </select>
+        </Field>
+
+        <Field label="recordRuns">
+          <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <input type="checkbox" checked={recordRuns} onChange={(e) => setRecordRuns(e.target.checked)} />
+            <span style={{ opacity: 0.85 }}>Keep per-stage run log</span>
+          </label>
+        </Field>
+      </div>
+
+      {/* Smooth scenario blocks */}
+      <div style={{ display: "grid", gridTemplateColumns: "1.25fr 0.75fr", gap: 12 }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          <div style={panelStyle}>
+            <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 10 }}>
+              <div style={{ fontWeight: 800 }}>Geometry & Resolution</div>
+              <div style={{ fontSize: 12, opacity: 0.7 }}>Core levers for capacity + timeline fidelity</div>
+            </div>
+
+            <div style={grid2Style}>
+              <Field label="Headings">
+                <input
+                  type="number"
+                  min={1}
+                  step={1}
+                  value={uiScenario.headings}
+                  onChange={(e) =>
+                    patchScenario((obj) => {
+                      obj.headings = clampInt(e.target.value, 1, 1);
+                    })
+                  }
+                  style={inputStyle}
+                />
+              </Field>
+
+              <Field label="Advance / round (m)">
+                <input
+                  type="number"
+                  min={0.1}
+                  step={0.1}
+                  value={uiScenario.metresPerRound}
+                  onChange={(e) =>
+                    patchScenario((obj) => {
+                      obj.metresPerRound = clampNum(e.target.value, 0.1, 0.1);
+                    })
+                  }
+                  style={inputStyle}
+                />
+              </Field>
+
+              <Field label="Tick (min)">
+                <input
+                  type="number"
+                  min={1}
+                  step={1}
+                  value={uiScenario.tickMin}
+                  onChange={(e) =>
+                    patchScenario((obj) => {
+                      obj.tickMin = clampInt(e.target.value, 1, 1);
+                    })
+                  }
+                  style={inputStyle}
+                />
+              </Field>
+
+              <Field label="Shift duration (min)">
+                <input
+                  type="number"
+                  min={1}
+                  step={10}
+                  value={uiScenario.shift.shiftDurationMin}
+                  onChange={(e) =>
+                    patchScenario((obj) => {
+                      obj.shift = obj.shift ?? {};
+                      obj.shift.shiftDurationMin = clampInt(e.target.value, 1, 480);
+                    })
+                  }
+                  style={inputStyle}
+                />
+              </Field>
+            </div>
+          </div>
+
+          <div style={panelStyle}>
+            <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 10 }}>
+              <div style={{ fontWeight: 800 }}>Resources</div>
+              <div style={{ fontSize: 12, opacity: 0.7 }}>Counts available per tick</div>
+            </div>
+
+            <div style={grid2Style}>
+              <Field label="Drill rigs">
+                <input
+                  type="number"
+                  min={0}
+                  value={uiScenario.resources.drillRigs}
+                  onChange={(e) =>
+                    patchScenario((obj) => {
+                      obj.resources = obj.resources ?? {};
+                      obj.resources.drillRigs = clampInt(e.target.value, 0, 0);
+                    })
+                  }
+                  style={inputStyle}
+                />
+              </Field>
+
+              <Field label="LHDs">
+                <input
+                  type="number"
+                  min={0}
+                  value={uiScenario.resources.lhds}
+                  onChange={(e) =>
+                    patchScenario((obj) => {
+                      obj.resources = obj.resources ?? {};
+                      obj.resources.lhds = clampInt(e.target.value, 0, 0);
+                    })
+                  }
+                  style={inputStyle}
+                />
+              </Field>
+
+              <Field label="Support crews">
+                <input
+                  type="number"
+                  min={0}
+                  value={uiScenario.resources.supportCrews}
+                  onChange={(e) =>
+                    patchScenario((obj) => {
+                      obj.resources = obj.resources ?? {};
+                      obj.resources.supportCrews = clampInt(e.target.value, 0, 0);
+                    })
+                  }
+                  style={inputStyle}
+                />
+              </Field>
+
+              <Field label="Blast crews">
+                <input
+                  type="number"
+                  min={0}
+                  value={uiScenario.resources.blastCrews}
+                  onChange={(e) =>
+                    patchScenario((obj) => {
+                      obj.resources = obj.resources ?? {};
+                      obj.resources.blastCrews = clampInt(e.target.value, 0, 0);
+                    })
+                  }
+                  style={inputStyle}
+                />
+              </Field>
+            </div>
+          </div>
+
+          <div style={panelStyle}>
+            <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 10 }}>
+              <div style={{ fontWeight: 800 }}>Durations</div>
+              <div style={{ fontSize: 12, opacity: 0.7 }}>Minutes per stage</div>
+            </div>
+
+            <div style={grid2Style}>
+              <Field label="Drill (min)">
+                <input
+                  type="number"
+                  min={0}
+                  value={uiScenario.durations.drill}
+                  onChange={(e) =>
+                    patchScenario((obj) => {
+                      obj.durations = obj.durations ?? {};
+                      obj.durations.drill = clampInt(e.target.value, 0, 0);
+                    })
+                  }
+                  style={inputStyle}
+                />
+              </Field>
+
+              <Field label="Charge (min)">
+                <input
+                  type="number"
+                  min={0}
+                  value={uiScenario.durations.charge}
+                  onChange={(e) =>
+                    patchScenario((obj) => {
+                      obj.durations = obj.durations ?? {};
+                      obj.durations.charge = clampInt(e.target.value, 0, 0);
+                    })
+                  }
+                  style={inputStyle}
+                />
+              </Field>
+
+              <Field label="Muck (min)">
+                <input
+                  type="number"
+                  min={0}
+                  value={uiScenario.durations.muck}
+                  onChange={(e) =>
+                    patchScenario((obj) => {
+                      obj.durations = obj.durations ?? {};
+                      obj.durations.muck = clampInt(e.target.value, 0, 0);
+                    })
+                  }
+                  style={inputStyle}
+                />
+              </Field>
+
+              <Field label="Support (min)">
+                <input
+                  type="number"
+                  min={0}
+                  value={uiScenario.durations.support}
+                  onChange={(e) =>
+                    patchScenario((obj) => {
+                      obj.durations = obj.durations ?? {};
+                      obj.durations.support = clampInt(e.target.value, 0, 0);
+                    })
+                  }
+                  style={inputStyle}
+                />
+              </Field>
+            </div>
+          </div>
+        </div>
+
+        {/* Validation + KPIs */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          <div style={panelStyle}>
+            <div style={{ fontWeight: 800, marginBottom: 8 }}>Validation</div>
+
+            {!parsed.ok ? (
+              <div style={errorBoxStyle}>
+                <b>JSON parse error</b>
+                <div style={{ marginTop: 6, whiteSpace: "pre-wrap" }}>{parsed.error}</div>
+              </div>
+            ) : parseError ? (
+              <div style={errorBoxStyle}>
+                <b>JSON parse error</b>
+                <div style={{ marginTop: 6, whiteSpace: "pre-wrap" }}>{parseError}</div>
+              </div>
+            ) : runError ? (
+              <div style={errorBoxStyle}>
+                <b>Scenario validation / run error</b>
+                <div style={{ marginTop: 6, whiteSpace: "pre-wrap" }}>{runError}</div>
+              </div>
+            ) : (
+              <div style={{ opacity: 0.8 }}>{parsed.ok ? "JSON looks valid. Click Validate or Run." : "Fix JSON errors above."}</div>
+            )}
+          </div>
+
+          <div style={panelStyle}>
+            <div style={{ fontWeight: 800, marginBottom: 8 }}>KPIs (after run)</div>
+            {kpis ? (
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 10 }}>
+                <KpiCard title="Rounds total" value={fmt(kpis.roundsCompletedTotal, 0)} />
+                <KpiCard title="Rounds / day (total)" value={fmt(kpis.roundsPerDayTotal, 2)} />
+                <KpiCard title="Metres total" value={fmt(kpis.metresAdvancedTotal, 1)} />
+                <KpiCard title="Metres / day (total)" value={fmt(kpis.metresPerDayTotal, 2)} />
+                <KpiCard title="Rounds / heading" value={fmt(kpis.roundsCompletedPerHeading, 2)} />
+                <KpiCard title="Heading utilization" value={fmt(kpis.headingUtilization * 100, 1) + "%"} />
+              </div>
+            ) : (
+              <div style={{ opacity: 0.7 }}>Run the simulation to populate KPIs.</div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Gantt (windowed to Simrun days, stretched to full width) */}
+      <div style={panelStyle}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 8 }}>
+          <div style={{ fontWeight: 800 }}>Gantt</div>
+          <div style={{ fontSize: 12, opacity: 0.7 }}>Viewing 0 → {simDays} days</div>
+        </div>
+
+        {intervals.length ? (
+          <GanttChart simMinutes={viewMinutes} intervals={intervals} />
+        ) : (
+          <div style={{ opacity: 0.7 }}>No timeline returned. Ensure engine returns intervals when includeGantt=true.</div>
+        )}
+      </div>
+
+      {/* Advanced */}
+      <details style={{ ...panelStyle, padding: 10 }}>
+        <summary style={{ cursor: "pointer", fontWeight: 700, opacity: 0.85 }}>Scenario JSON (advanced)</summary>
+        <pre style={{ ...preStyle, marginTop: 10 }}>{scenarioText}</pre>
+      </details>
+
+      <details style={{ ...panelStyle, padding: 10 }}>
+        <summary style={{ cursor: "pointer", fontWeight: 700, opacity: 0.85 }}>Raw result (JSON)</summary>
+        <pre style={{ ...preStyle, marginTop: 10 }}>{result ? pretty(result).slice(0, 40000) : "Run to see output."}</pre>
+      </details>
     </div>
   );
 }
 
+/** Normalizes any scenario-ish object into the canonical UI shape (so inputs never crash). */
+function normalizeScenario(partial: any) {
+  const s = partial ?? {};
+  const shift = s.shift ?? {};
+  const durations = s.durations ?? {};
+  const resources = s.resources ?? {};
+
+  const headings = clampInt(s.headings, 1, 3);
+
+  return {
+    simDays: clampInt(s.simDays, 1, 30),
+    tickMin: clampInt(s.tickMin, 1, 5),
+    headings,
+    metresPerRound: clampNum(s.metresPerRound, 0.1, 3.0),
+
+    shift: {
+      shiftDurationMin: clampInt(shift.shiftDurationMin, 1, 480),
+      blastTiming:
+        shift.blastTiming === "midshift" || shift.blastTiming === "endOfShift" ? shift.blastTiming : "endOfShift",
+    },
+
+    durations: {
+      drill: clampInt(durations.drill, 0, 180),
+      charge: clampInt(durations.charge, 0, 60),
+      muck: clampInt(durations.muck, 0, 240),
+      support: clampInt(durations.support ?? 0, 0, 120),
+    },
+
+    resources: {
+      drillRigs: clampInt(resources.drillRigs ?? headings, 0, headings),
+      lhds: clampInt(resources.lhds ?? 1, 0, 1),
+      supportCrews: clampInt(resources.supportCrews ?? 1, 0, 1),
+      blastCrews: clampInt(resources.blastCrews ?? 1, 0, 1),
+    },
+  };
+}
+
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div className="grid grid-cols-2 items-center gap-3">
-      <div className="text-sm text-gray-600">{label}</div>
+    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+      <div style={{ fontSize: 12, opacity: 0.8 }}>{label}</div>
       {children}
     </div>
   );
 }
 
-function NumberInput(props: React.InputHTMLAttributes<HTMLInputElement>) {
+function KpiCard({ title, value }: { title: string; value: string }) {
   return (
-    <input
-      {...props}
-      type="number"
-      className="h-9 w-full rounded-lg border border-gray-200 bg-white px-3 text-sm text-gray-900 outline-none focus:ring-2 focus:ring-gray-200"
-    />
-  );
-}
-
-function Select(props: React.SelectHTMLAttributes<HTMLSelectElement>) {
-  return (
-    <select
-      {...props}
-      className="h-9 w-full rounded-lg border border-gray-200 bg-white px-3 text-sm text-gray-900 outline-none focus:ring-2 focus:ring-gray-200"
-    />
-  );
-}
-
-function Button(props: React.ButtonHTMLAttributes<HTMLButtonElement>) {
-  const { className = "", ...rest } = props;
-  return (
-    <button
-      {...rest}
-      className={[
-        "h-9 rounded-lg border border-gray-200 bg-white px-3 text-sm text-gray-900",
-        "hover:bg-gray-50 active:bg-gray-100",
-        className,
-      ].join(" ")}
-    />
-  );
-}
-
-export default function DebugSimulationTest() {
-  const [scenario, setScenario] = useState<Scenario>(() =>
-    normalizeScenario(deepClone(importedDefaultScenario))
-  );
-
-  const result = useMemo(() => {
-    try {
-      const kpis = simulate(scenario);
-      return { ok: true as const, kpis };
-    } catch (err) {
-      return {
-        ok: false as const,
-        error: err instanceof Error ? err.message : String(err),
-      };
-    }
-  }, [scenario]);
-
-  const setBlastTiming = (timing: BlastTiming) => {
-    setScenario((s) => normalizeScenario({ ...s, shift: { ...s.shift, blastTiming: timing } }));
-  };
-
-  const setShiftDuration = (v: number) => {
-    setScenario((s) => normalizeScenario({ ...s, shift: { ...s.shift, shiftDurationMin: v } }));
-  };
-
-  const setTopLevel = (
-    key: "simDays" | "tickMin" | "headings" | "metresPerRound",
-    v: number
-  ) => setScenario((s) => normalizeScenario({ ...s, [key]: v }));
-
-  const setDuration = (key: keyof Scenario["durations"], v: number) => {
-    setScenario((s) => normalizeScenario({ ...s, durations: { ...s.durations, [key]: v } }));
-  };
-
-  return (
-    <div className="min-h-screen bg-gray-50">
-      <div className="mx-auto max-w-6xl p-6">
-        <div className="mb-5 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
-          <div>
-            <div className="text-xl font-semibold text-gray-900">Debug Simulation</div>
-            <div className="text-sm text-gray-600">Engine smoke test + scenario controls</div>
-          </div>
-
-          <div className="flex gap-2">
-            <Button onClick={() => setScenario(normalizeScenario(deepClone(importedDefaultScenario)))}>
-              Reset defaults
-            </Button>
-            <Button onClick={() => setScenario((s) => normalizeScenario({ ...s, simDays: 2 }))}>
-              Fast run (2 days)
-            </Button>
-          </div>
-        </div>
-
-        <div className="grid gap-4 lg:grid-cols-3">
-          <Card title="Scenario">
-            <div className="space-y-3">
-              <Field label="Blast timing">
-                <Select
-                  value={scenario.shift.blastTiming}
-                  onChange={(e) => setBlastTiming(e.target.value as BlastTiming)}
-                >
-                  {BLAST_TIMING_OPTIONS.map((o) => (
-                    <option key={o.value} value={o.value}>
-                      {o.label}
-                    </option>
-                  ))}
-                </Select>
-              </Field>
-
-              <Field label="Shift duration (min)">
-                <NumberInput
-                  value={scenario.shift.shiftDurationMin}
-                  onChange={(e) => setShiftDuration(Number(e.target.value))}
-                />
-              </Field>
-
-              <div className="my-2 border-t border-gray-200" />
-
-              <Field label="Sim days">
-                <NumberInput
-                  value={scenario.simDays}
-                  onChange={(e) => setTopLevel("simDays", Number(e.target.value))}
-                />
-              </Field>
-
-              <Field label="Tick (min)">
-                <NumberInput
-                  value={scenario.tickMin}
-                  onChange={(e) => setTopLevel("tickMin", Number(e.target.value))}
-                />
-              </Field>
-
-              <Field label="Headings">
-                <NumberInput
-                  value={scenario.headings}
-                  onChange={(e) => setTopLevel("headings", Number(e.target.value))}
-                />
-              </Field>
-
-              <Field label="Metres / round">
-                <NumberInput
-                  step="0.1"
-                  value={scenario.metresPerRound}
-                  onChange={(e) => setTopLevel("metresPerRound", Number(e.target.value))}
-                />
-              </Field>
-
-              <div className="my-2 border-t border-gray-200" />
-
-              <Field label="Drill (min)">
-                <NumberInput
-                  value={scenario.durations.drill}
-                  onChange={(e) => setDuration("drill", Number(e.target.value))}
-                />
-              </Field>
-
-              <Field label="Charge (min)">
-                <NumberInput
-                  value={scenario.durations.charge}
-                  onChange={(e) => setDuration("charge", Number(e.target.value))}
-                />
-              </Field>
-
-              <Field label="Muck (min)">
-                <NumberInput
-                  value={scenario.durations.muck}
-                  onChange={(e) => setDuration("muck", Number(e.target.value))}
-                />
-              </Field>
-            </div>
-          </Card>
-
-          <Card title="Result">
-            {!result.ok ? (
-              <div className="rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-700">
-                <div className="mb-1 font-semibold">Simulation error</div>
-                <div className="whitespace-pre-wrap">{result.error}</div>
-              </div>
-            ) : (
-              <pre className="max-h-[520px] overflow-auto rounded-xl bg-gray-100 p-3 text-xs leading-5 text-gray-900">
-                {JSON.stringify(result.kpis, null, 2)}
-              </pre>
-            )}
-          </Card>
-
-          <Card title="Scenario JSON">
-            <pre className="max-h-[520px] overflow-auto rounded-xl bg-gray-100 p-3 text-xs leading-5 text-gray-900">
-              {JSON.stringify(scenario, null, 2)}
-            </pre>
-          </Card>
-        </div>
-      </div>
+    <div style={{ border: "1px solid rgba(0,0,0,0.12)", borderRadius: 14, padding: 12, background: "white" }}>
+      <div style={{ fontSize: 12, opacity: 0.75 }}>{title}</div>
+      <div style={{ fontSize: 18, fontWeight: 750, marginTop: 6 }}>{value}</div>
     </div>
   );
 }
+
+const panelStyle: React.CSSProperties = {
+  border: "1px solid rgba(0,0,0,0.12)",
+  borderRadius: 16,
+  padding: 14,
+  background: "rgba(255,255,255,0.65)",
+};
+
+const grid2Style: React.CSSProperties = {
+  display: "grid",
+  gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+  gap: 10,
+};
+
+const inputStyle: React.CSSProperties = {
+  padding: "8px 10px",
+  borderRadius: 10,
+  border: "1px solid rgba(0,0,0,0.14)",
+  background: "white",
+};
+
+const btnStyle: React.CSSProperties = {
+  padding: "8px 12px",
+  borderRadius: 10,
+  border: "1px solid rgba(0,0,0,0.2)",
+  cursor: "pointer",
+  background: "white",
+};
+
+const errorBoxStyle: React.CSSProperties = {
+  padding: 12,
+  borderRadius: 12,
+  background: "rgba(255,0,0,0.08)",
+  border: "1px solid rgba(255,0,0,0.25)",
+};
+
+const preStyle: React.CSSProperties = {
+  padding: 12,
+  borderRadius: 12,
+  background: "rgba(0,0,0,0.04)",
+  overflow: "auto",
+  maxHeight: 420,
+  fontSize: 12,
+  whiteSpace: "pre-wrap",
+};
