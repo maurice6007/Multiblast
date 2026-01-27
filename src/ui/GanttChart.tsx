@@ -6,21 +6,21 @@ const STAGE_LABEL: Record<string, string> = {
   DRILL: "Drill",
   CHARGE: "Charge",
   BLAST_READY: "Blast ready",
+  REENTRY: "Re-entry",
   WAITING_FOR_BLAST: "Waiting blast",
   MUCK: "Muck",
-  SUPPORT: "Support", // ✅ ADD
+  SUPPORT: "Support",
 };
-
 
 const STAGE_COLOR: Record<string, string> = {
-  DRILL: "#bfdbfe",          // blue
-  CHARGE: "#fde68a",         // yellow
-  BLAST_READY: "#e9d5ff",    // purple
+  DRILL: "#bfdbfe", // blue
+  CHARGE: "#fde68a", // yellow
+  BLAST_READY: "#e9d5ff", // purple
+  REENTRY: "#fdba74", // orange
   WAITING_FOR_BLAST: "#e5e7eb", // grey
-  MUCK: "#bbf7d0",           // green
-  SUPPORT: "#d6b48c",        // ✅ brown / sand (clearly distinct)
+  MUCK: "#bbf7d0", // green
+  SUPPORT: "#d6b48c", // brown / sand
 };
-
 
 type Props = {
   simMinutes: number;
@@ -51,7 +51,7 @@ export default function GanttChart({ simMinutes, intervals, shiftsPerDay }: Prop
         Timeline (0 → {simMinutes} min) • Shifts/day: {shiftsPerDay}
       </div>
 
-      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
         {headingIds.map((hid) => {
           const row = intervals.filter((x) => x.headingId === hid);
 
@@ -67,7 +67,7 @@ export default function GanttChart({ simMinutes, intervals, shiftsPerDay }: Prop
             >
               <div
                 style={{
-                  fontSize: 12,
+                  fontSize: 13,
                   fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
                   opacity: 0.85,
                 }}
@@ -78,7 +78,7 @@ export default function GanttChart({ simMinutes, intervals, shiftsPerDay }: Prop
               <div
                 style={{
                   position: "relative",
-                  height: 32,
+                  height: 64, // 2× taller
                   borderRadius: 10,
                   border: "1px solid rgba(0,0,0,0.12)",
                   background: "white",
@@ -135,6 +135,7 @@ export default function GanttChart({ simMinutes, intervals, shiftsPerDay }: Prop
         })}
       </div>
 
+      {/* Legend */}
       <div style={{ display: "flex", flexWrap: "wrap", gap: 10, fontSize: 12, opacity: 0.8 }}>
         {Object.keys(STAGE_LABEL).map((k) => (
           <div key={k} style={{ display: "flex", alignItems: "center", gap: 6 }}>

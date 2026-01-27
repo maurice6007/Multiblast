@@ -37,7 +37,7 @@ function clampNum(n: any, min = 0, fallback = 0) {
 }
 
 /**
- * Canonical scenario template (engine shape)
+ * Canonical scenario template (engine-ish shape)
  */
 const STARTER_SCENARIO: any = {
   name: "Starter Scenario",
@@ -47,7 +47,7 @@ const STARTER_SCENARIO: any = {
   metresPerRound: 3.0,
 
   shift: {
-    shiftDurationMin: 480, // effective shift duration input stays here
+    shiftDurationMin: 480, // workable time before shift change
     blastTiming: "endOfShift", // "midshift" | "endOfShift"
   },
 
@@ -63,6 +63,10 @@ const STARTER_SCENARIO: any = {
     lhds: 1,
     supportCrews: 1,
     blastCrews: 1,
+  },
+
+  support: {
+    jumboBolting: false,
   },
 };
 
@@ -81,8 +85,8 @@ export default function DebugSimulationTest() {
 
   const parsed = useMemo(() => safeParseJson(scenarioText), [scenarioText]);
 
-  // Engine wrapper expects hoursPerShift; derive from shifts/day (12 or 8)
-  const hoursPerShift = 24 / shiftsPerDay;
+  // Derived scheduled shift length (8h or 12h)
+  const hoursPerShift = useMemo(() => 24 / shiftsPerDay, [shiftsPerDay]);
 
   // Canonical object for UI controls even if JSON is malformed
   const uiScenario = useMemo(() => {
@@ -94,7 +98,8 @@ export default function DebugSimulationTest() {
     const p = safeParseJson(scenarioText);
     const base = p.ok ? deepClone(p.value) : deepClone(uiScenario);
     patch(base);
-    setScenarioText(pretty(normalizeScenario(base)));
+    const normalized = normalizeScenario(base);
+    setScenarioText(pretty(normalized));
   }
 
   function validateOnly() {
@@ -108,6 +113,7 @@ export default function DebugSimulationTest() {
     setParseError("");
 
     try {
+      // wrapper reads legacyOptions.hoursPerShift for scheduled shift length
       simulateScenario(parsed.value, { simDays: 1, hoursPerShift, recordRuns: false });
       setRunError("");
     } catch (e: any) {
@@ -139,9 +145,10 @@ export default function DebugSimulationTest() {
     }
   }
 
+  // Result shape: either {kpis, simMinutes, intervals} or legacy KPI-only
   const kpis = result?.kpis ?? result;
 
-  // Gantt window: simDays worth of minutes
+  // Gantt should show ONLY the run window (simDays), stretched to full width
   const viewMinutes = simDays * 24 * 60;
 
   const intervalsAll = result?.intervals ?? [];
@@ -161,6 +168,8 @@ export default function DebugSimulationTest() {
       ? uiScenario.shift.blastTiming
       : "endOfShift";
 
+  const jumboBolting = !!uiScenario.support?.jumboBolting;
+
   return (
     <div style={{ padding: 16, fontFamily: "system-ui", display: "flex", flexDirection: "column", gap: 14 }}>
       {/* Header */}
@@ -175,37 +184,49 @@ export default function DebugSimulationTest() {
           Run
         </button>
 
-        <button onClick={() => setScenarioText(pretty(STARTER_SCENARIO))} style={{ ...btnStyle, marginLeft: "auto" }}>
+        <button
+          onClick={() => {
+            setScenarioText(pretty(STARTER_SCENARIO));
+            setSimDays(STARTER_SCENARIO.simDays ?? 30);
+          }}
+          style={{ ...btnStyle, marginLeft: "auto" }}
+        >
           Reset template
         </button>
       </div>
 
       {/* Global run controls */}
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))",
-          gap: 10,
-        }}
-      >
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 10 }}>
         <Field label="Simrun days">
-  <input
-    type="number"
-    value={simDays}
-    min={1}
-    onChange={(e) => {
-      const v = Math.max(1, Number(e.target.value) || 1);
-      setSimDays(v);
+          <input
+            type="number"
+            value={simDays}
+            min={1}
+            onChange={(e) => {
+              const v = Math.max(1, Number(e.target.value) || 1);
+              setSimDays(v);
+              // keep JSON in sync so engine honours simDays (via Scenario)
+              patchScenario((obj) => {
+                obj.simDays = v;
+              });
+            }}
+            style={inputStyle}
+          />
+        </Field>
 
-      // ✅ keep JSON scenario in sync so engine honors it
-      patchScenario((obj) => {
-        obj.simDays = v;
-      });
-    }}
-    style={inputStyle}
-  />
-</Field>
-
+        <Field label="Shifts per day">
+          <div style={{ display: "grid", gap: 6 }}>
+            <select
+              value={shiftsPerDay}
+              onChange={(e) => setShiftsPerDay(Number(e.target.value) as 2 | 3)}
+              style={inputStyle}
+            >
+              <option value={2}>2 × 12h</option>
+              <option value={3}>3 × 8h</option>
+            </select>
+            <div style={{ fontSize: 11, opacity: 0.7 }}>Scheduled shift length: {hoursPerShift}h</div>
+          </div>
+        </Field>
 
         <Field label="Blasting">
           <select
@@ -218,7 +239,7 @@ export default function DebugSimulationTest() {
             }
             style={inputStyle}
           >
-            <option value="midshift">ASAP (no delay)</option>
+            <option value="midshift">ASAP (midshift)</option>
             <option value="endOfShift">End of shift</option>
           </select>
         </Field>
@@ -287,24 +308,8 @@ export default function DebugSimulationTest() {
                 />
               </Field>
 
-              <Field label="Shifts per day">
-  <div style={{ display: "grid", gap: 6 }}>
-    <select
-      value={shiftsPerDay}
-      onChange={(e) => setShiftsPerDay(Number(e.target.value) as 2 | 3)}
-      style={inputStyle}
-    >
-      <option value={2}>2 × 12h</option>
-      <option value={3}>3 × 8h</option>
-    </select>
-    <div style={{ fontSize: 11, opacity: 0.7 }}>
-      Scheduled shift length: {(24 / shiftsPerDay).toFixed(0)}h
-    </div>
-  </div>
-</Field>
-
-
-              <Field label="Shift duration (min)">
+              {/* Workable time before shift change (kept intentionally) */}
+              <Field label="Shift duration (workable min)">
                 <input
                   type="number"
                   min={1}
@@ -371,10 +376,12 @@ export default function DebugSimulationTest() {
                     })
                   }
                   style={inputStyle}
+                  disabled={jumboBolting}
+                  title={jumboBolting ? "Disabled: Support uses drill rigs when Jumbo bolting is on." : undefined}
                 />
               </Field>
 
-              <Field label="Blast crews">
+              <Field label="Blast crews (charging)">
                 <input
                   type="number"
                   min={0}
@@ -388,6 +395,26 @@ export default function DebugSimulationTest() {
                   style={inputStyle}
                 />
               </Field>
+
+              <div style={{ gridColumn: "1 / -1" }}>
+                <Field label="Jumbo bolting">
+                  <label style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                    <input
+                      type="checkbox"
+                      checked={jumboBolting}
+                      onChange={(e) =>
+                        patchScenario((obj) => {
+                          obj.support = obj.support ?? {};
+                          obj.support.jumboBolting = e.target.checked;
+                        })
+                      }
+                    />
+                    <span style={{ opacity: 0.9 }}>
+                      When enabled, <b>Support consumes Drill rigs</b> (no separate support crews).
+                    </span>
+                  </label>
+                </Field>
+              </div>
             </div>
           </div>
 
@@ -504,7 +531,7 @@ export default function DebugSimulationTest() {
         </div>
       </div>
 
-      {/* Gantt (2× bigger: taller rows happen in GanttChart; 2× wider via wrapper here) */}
+      {/* Gantt */}
       <div style={panelStyle}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 8 }}>
           <div style={{ fontWeight: 800 }}>Gantt</div>
@@ -512,11 +539,7 @@ export default function DebugSimulationTest() {
         </div>
 
         {intervals.length ? (
-          <div style={{ width: "100%", overflowX: "auto", overflowY: "hidden", paddingBottom: 6 }}>
-            <div style={{ width: "200%", minWidth: 900 }}>
-              <GanttChart simMinutes={viewMinutes} intervals={intervals} shiftsPerDay={shiftsPerDay} />
-            </div>
-          </div>
+          <GanttChart simMinutes={viewMinutes} intervals={intervals} shiftsPerDay={shiftsPerDay} />
         ) : (
           <div style={{ opacity: 0.7 }}>No timeline returned. Ensure engine returns intervals when includeGantt=true.</div>
         )}
@@ -542,6 +565,7 @@ function normalizeScenario(partial: any) {
   const shift = s.shift ?? {};
   const durations = s.durations ?? {};
   const resources = s.resources ?? {};
+  const supportCfg = s.support ?? {};
 
   const headings = clampInt(s.headings, 1, 3);
 
@@ -553,7 +577,8 @@ function normalizeScenario(partial: any) {
 
     shift: {
       shiftDurationMin: clampInt(shift.shiftDurationMin, 1, 480),
-      blastTiming: shift.blastTiming === "midshift" || shift.blastTiming === "endOfShift" ? shift.blastTiming : "endOfShift",
+      blastTiming:
+        shift.blastTiming === "midshift" || shift.blastTiming === "endOfShift" ? shift.blastTiming : "endOfShift",
     },
 
     durations: {
@@ -568,6 +593,10 @@ function normalizeScenario(partial: any) {
       lhds: clampInt(resources.lhds ?? 1, 0, 1),
       supportCrews: clampInt(resources.supportCrews ?? 1, 0, 1),
       blastCrews: clampInt(resources.blastCrews ?? 1, 0, 1),
+    },
+
+    support: {
+      jumboBolting: !!(supportCfg.jumboBolting ?? s.jumboBolting ?? false),
     },
   };
 }

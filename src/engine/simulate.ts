@@ -24,6 +24,7 @@ export type GanttStage =
   | "DRILL"
   | "CHARGE"
   | "BLAST_READY"
+  | "REENTRY"
   | "WAITING_FOR_BLAST"
   | "MUCK"
   | "SUPPORT";
@@ -57,9 +58,15 @@ export function simulateDetailed(s: Scenario): SimulationDetailedResult {
  * Back-compat wrapper for old UI:
  * - if includeGantt/includeTimeline: return { kpis, simMinutes, intervals }
  * - else return { kpis } so UI can always do result.kpis
+ *
+ * IMPORTANT:
+ * - legacyOptions.hoursPerShift drives scheduled shift length (8h/12h) for end-of-shift blasting logic.
+ * - s.shift.shiftDurationMin is workable time before shift change.
+ * - shift change window = scheduledShiftMin - shiftDurationMin.
+ * - blast crews are consumed by CHARGE; blasting is instantaneous.
  */
 export function simulateScenario(legacyScenario: any, legacyOptions?: any): any {
-  const normalized = normalizeScenarioForEngine(legacyScenario);
+  const normalized = normalizeScenarioForEngine(legacyScenario, legacyOptions);
 
   if (legacyOptions?.includeGantt || legacyOptions?.includeTimeline) {
     return simulateDetailed(normalized);
@@ -76,15 +83,10 @@ type Stage = GanttStage;
 interface HeadingState {
   id: string;
   stage: Stage;
-  remainingMin: number;
+  remainingMin: number; // countdown for work stages AND gating stages
   busyMin: number;
   roundsCompleted: number;
   metresAdvanced: number;
-}
-
-interface PendingBlast {
-  headingId: string;
-  scheduledAtMin: number;
 }
 
 interface RunOptions {
@@ -98,8 +100,9 @@ interface RunResult {
 }
 
 type ResourceKey = keyof Resources;
-
 type ResourcePool = Resources;
+
+const REENTRY_MIN_MIDSHIFT = 30;
 
 /* =========================
    Engine runner
@@ -111,11 +114,7 @@ function runEngine(s: Scenario, opts: RunOptions): RunResult {
   const simMinutes = s.simDays * 24 * 60;
   const tickMin = s.tickMin;
 
-  const headings: HeadingState[] = Array.from({ length: s.headings }, (_, i) =>
-    newHeading(`H${i + 1}`, s)
-  );
-
-  const pendingBlasts: PendingBlast[] = [];
+  const headings: HeadingState[] = Array.from({ length: s.headings }, (_, i) => newHeading(`H${i + 1}`, s));
 
   // --- timeline capture ---
   const intervals: GanttInterval[] = [];
@@ -123,11 +122,13 @@ function runEngine(s: Scenario, opts: RunOptions): RunResult {
 
   const closeAndOpenIfStageChanged = (h: HeadingState, nowMin: number) => {
     if (!opts.captureTimeline) return;
+
     const open = openByHeading.get(h.id);
     if (!open) {
       openByHeading.set(h.id, { stage: h.stage, startMin: nowMin });
       return;
     }
+
     if (open.stage !== h.stage) {
       intervals.push({ headingId: h.id, stage: open.stage, startMin: open.startMin, endMin: nowMin });
       openByHeading.set(h.id, { stage: h.stage, startMin: nowMin });
@@ -142,15 +143,11 @@ function runEngine(s: Scenario, opts: RunOptions): RunResult {
     // reset available resources each tick
     const avail: ResourcePool = makeResourcePool(s);
 
-    // 1) Execute any due blasts FIRST (consumes blastCrews)
-    executePendingBlasts(nowMin, pendingBlasts, headings, s, avail);
-    if (opts.captureTimeline) for (const h of headings) closeAndOpenIfStageChanged(h, nowMin);
-
-    // 2) Advance each heading if it can acquire the resource for its current stage
+    // Advance each heading if it can acquire the resource for its current stage
     for (const h of headings) {
       const beforeStage = h.stage;
 
-      advanceHeadingByTick(h, nowMin, tickMin, pendingBlasts, s, avail);
+      advanceHeadingByTick(h, nowMin, tickMin, s, avail);
 
       if (opts.captureTimeline && h.stage !== beforeStage) {
         // stage change effective end-of-tick
@@ -176,31 +173,36 @@ function runEngine(s: Scenario, opts: RunOptions): RunResult {
    Core simulation logic (resource-constrained)
    ========================= */
 
-function advanceHeadingByTick(
-  h: HeadingState,
-  nowMin: number,
-  tickMin: number,
-  pendingBlasts: PendingBlast[],
-  s: Scenario,
-  avail: ResourcePool
-): void {
-  // Special handling when blast-ready: blasting may consume blastCrews (ASAP)
+function advanceHeadingByTick(h: HeadingState, nowMin: number, tickMin: number, s: Scenario, avail: ResourcePool): void {
+  // Gate stages (no resources)
   if (h.stage === "BLAST_READY") {
-    onBlastReady(h, nowMin, pendingBlasts, s, avail);
+    onBlastReady(h, nowMin, tickMin, s);
     return;
   }
 
-  // Waiting state: no work
-  if (h.stage === "WAITING_FOR_BLAST") return;
+  if (h.stage === "REENTRY") {
+    if (h.remainingMin > 0) h.remainingMin = Math.max(0, h.remainingMin - tickMin);
+    if (h.remainingMin === 0) {
+      h.stage = "MUCK";
+      h.remainingMin = s.durations.muck;
+    }
+    return;
+  }
+
+  if (h.stage === "WAITING_FOR_BLAST") {
+    if (h.remainingMin > 0) h.remainingMin = Math.max(0, h.remainingMin - tickMin);
+    if (h.remainingMin === 0) {
+      h.stage = "MUCK";
+      h.remainingMin = s.durations.muck;
+    }
+    return;
+  }
 
   // Determine if this stage needs a resource to do work
-  const rKey = resourceForWorkStage(h.stage);
+  const rKey = resourceForWorkStage(h.stage, s);
   const canWorkThisTick = rKey ? tryConsume(avail, rKey) : true;
 
-  if (!canWorkThisTick) {
-    // no resource => no progress this tick
-    return;
-  }
+  if (!canWorkThisTick) return;
 
   // Work happens this tick
   h.busyMin += tickMin;
@@ -215,6 +217,7 @@ function advanceHeadingByTick(
       return;
 
     case "CHARGE":
+      // Charging consumes blast crews. Blast is instantaneous and handled by BLAST_READY gating.
       h.stage = "BLAST_READY";
       h.remainingMin = 0;
       return;
@@ -243,76 +246,46 @@ function advanceHeadingByTick(
   }
 }
 
-function onBlastReady(
-  h: HeadingState,
-  nowMin: number,
-  pendingBlasts: PendingBlast[],
-  s: Scenario,
-  avail: ResourcePool
-): void {
+/**
+ * BLAST_READY handler.
+ * - midshift (ASAP): blast instantaneous → REENTRY(30 min) → MUCK
+ * - endOfShift: blast occurs during shift change; re-entry is engulfed by shift change window:
+ *      WAITING_FOR_BLAST = scheduledShiftMin - shiftDurationMin
+ *
+ * End-of-shift modeled as:
+ *  - BLAST_READY counts down to workEnd (start of shift change)
+ *  - then WAITING_FOR_BLAST counts down to shiftEnd (next shift start) → MUCK
+ */
+function onBlastReady(h: HeadingState, nowMin: number, tickMin: number, s: Scenario): void {
   if (s.shift.blastTiming === "midshift") {
-    // ASAP / immediate, but requires blast crew to fire
-    if (tryConsume(avail, "blastCrews")) {
-      doBlast(h, s);
-    }
-    // else: stay BLAST_READY until a crew is available on a later tick
+    h.stage = "REENTRY";
+    h.remainingMin = REENTRY_MIN_MIDSHIFT;
     return;
   }
 
-  // End-of-shift gating
-  const shiftEnd = shiftEndMin(nowMin, s.shift.shiftDurationMin);
+  const { workEnd, shiftEnd } = shiftBoundaries(nowMin, s);
 
-  if (!pendingBlasts.some((b) => b.headingId === h.id)) {
-    pendingBlasts.push({ headingId: h.id, scheduledAtMin: shiftEnd });
+  // If we are already in shift change window, transition to waiting immediately
+  if (nowMin >= workEnd) {
+    h.stage = "WAITING_FOR_BLAST";
+    const effectiveNow = nowMin + tickMin;
+    h.remainingMin = Math.max(0, shiftEnd - effectiveNow);
+    return;
   }
 
-  h.stage = "WAITING_FOR_BLAST";
-  h.remainingMin = 0;
-}
-
-function executePendingBlasts(
-  nowMin: number,
-  pendingBlasts: PendingBlast[],
-  headings: HeadingState[],
-  s: Scenario,
-  avail: ResourcePool
-): void {
-  if (pendingBlasts.length === 0) return;
-
-  // execute in time order, stable
-  pendingBlasts.sort((a, b) => a.scheduledAtMin - b.scheduledAtMin);
-
-  const remaining: PendingBlast[] = [];
-
-  for (const b of pendingBlasts) {
-    if (b.scheduledAtMin > nowMin) {
-      remaining.push(b);
-      continue;
-    }
-
-    const h = headings.find((x) => x.id === b.headingId);
-    if (!h) continue;
-
-    if (h.stage !== "WAITING_FOR_BLAST") continue;
-
-    // Need a blast crew available to execute
-    if (!tryConsume(avail, "blastCrews")) {
-      // no crew this tick => try again next tick (keep pending)
-      remaining.push({ ...b, scheduledAtMin: nowMin + s.tickMin });
-      continue;
-    }
-
-    doBlast(h, s);
+  // Still in workable time: remain BLAST_READY until shift change starts.
+  // Use remainingMin as countdown to workEnd.
+  if (h.remainingMin <= 0) {
+    h.remainingMin = Math.max(0, workEnd - nowMin);
+  } else {
+    h.remainingMin = Math.max(0, h.remainingMin - tickMin);
   }
 
-  pendingBlasts.length = 0;
-  pendingBlasts.push(...remaining);
-}
-
-function doBlast(h: HeadingState, s: Scenario): void {
-  // Blast is instantaneous; post-blast delays can be modeled as another stage later.
-  h.stage = "MUCK";
-  h.remainingMin = s.durations.muck;
+  if (h.remainingMin === 0) {
+    h.stage = "WAITING_FOR_BLAST";
+    const effectiveNow = nowMin + tickMin;
+    h.remainingMin = Math.max(0, shiftEnd - effectiveNow);
+  }
 }
 
 function completeRound(h: HeadingState, s: Scenario): void {
@@ -325,7 +298,6 @@ function completeRound(h: HeadingState, s: Scenario): void {
    ========================= */
 
 function makeResourcePool(s: Scenario): ResourcePool {
-  // defaults: generous but finite
   const r = s.resources ?? {
     drillRigs: s.headings,
     lhds: s.headings,
@@ -347,16 +319,22 @@ function clampNonNegInt(n: any): number {
   return Math.max(0, Math.floor(v));
 }
 
-function resourceForWorkStage(stage: Stage): ResourceKey | null {
+function isJumboBoltingEnabled(s: Scenario): boolean {
+  return (s as any)?.support?.jumboBolting === true;
+}
+
+function resourceForWorkStage(stage: Stage, s: Scenario): ResourceKey | null {
   switch (stage) {
     case "DRILL":
       return "drillRigs";
     case "CHARGE":
+      // blast crews do charging-up
       return "blastCrews";
     case "MUCK":
       return "lhds";
     case "SUPPORT":
-      return "supportCrews";
+      // Jumbo bolting consumes drill rigs; otherwise use dedicated support crews
+      return isJumboBoltingEnabled(s) ? "drillRigs" : "supportCrews";
     default:
       return null;
   }
@@ -413,10 +391,18 @@ function validateScenario(s: Scenario): void {
   if (!Number.isFinite(s.metresPerRound) || s.metresPerRound <= 0) throw new Error("metresPerRound must be > 0");
 
   if (!s.shift) throw new Error("shift is missing");
-  if (!Number.isFinite(s.shift.shiftDurationMin) || s.shift.shiftDurationMin <= 0)
+  if (!Number.isFinite(s.shift.shiftDurationMin) || s.shift.shiftDurationMin <= 0) {
     throw new Error("shift.shiftDurationMin must be > 0");
-  if (s.shift.blastTiming !== "midshift" && s.shift.blastTiming !== "endOfShift")
+  }
+  if (s.shift.blastTiming !== "midshift" && s.shift.blastTiming !== "endOfShift") {
     throw new Error("shift.blastTiming must be 'midshift' or 'endOfShift'");
+  }
+
+  const sched = getScheduledShiftMin(s);
+  if (!Number.isFinite(sched) || sched <= 0) {
+    throw new Error("scheduledShiftMin must be > 0 (via legacyOptions.hoursPerShift)");
+  }
+  if (s.shift.shiftDurationMin > sched) throw new Error("shiftDurationMin cannot exceed scheduled shift length");
 
   if (!s.durations) throw new Error("durations is missing");
   if (!Number.isFinite(s.durations.drill)) throw new Error("durations.drill is missing/invalid");
@@ -445,7 +431,7 @@ function assertSimulationProgress(kpis: SimulationKpis, s: Scenario): void {
    Scenario normalization (legacy UI -> engine)
    ========================= */
 
-function normalizeScenarioForEngine(input: any): Scenario {
+function normalizeScenarioForEngine(input: any, legacyOptions?: any): Scenario {
   const s = input ?? {};
   const shiftSrc = s.shift ?? s.shifts ?? s.shiftConfig ?? {};
   const durationsSrc = s.durations ?? s.roundDurations ?? s.cycle ?? s.timing ?? {};
@@ -460,7 +446,6 @@ function normalizeScenarioForEngine(input: any): Scenario {
 
   const shiftDurationMin =
     pickNumber(shiftSrc.shiftDurationMin, shiftSrc.durationMin, s.shiftDurationMin, s.shiftMin) ??
-    // legacy: hoursPerShift may be provided via options in the old UI; engine uses shiftDurationMin.
     (Number.isFinite(s.hoursPerShift) ? Number(s.hoursPerShift) * 60 : 480);
 
   const headings = pickNumber(s.headings, s.numHeadings, s.activeHeadings) ?? 2;
@@ -473,16 +458,29 @@ function normalizeScenarioForEngine(input: any): Scenario {
     blastCrews: pickNumber(resourcesSrc.blastCrews, s.blastCrews) ?? 1,
   };
 
-  return {
+  // Scheduled shift length comes from legacyOptions.hoursPerShift (8h / 12h)
+  const hoursPerShiftOpt = legacyOptions?.hoursPerShift;
+  const scheduledShiftMin =
+    Number.isFinite(hoursPerShiftOpt) && Number(hoursPerShiftOpt) > 0
+      ? Number(hoursPerShiftOpt) * 60
+      : pickNumber(shiftSrc.scheduledShiftMin, s.scheduledShiftMin, s.shiftScheduledMin) ?? shiftDurationMin;
+
+  const shiftObj: any = {
+    shiftDurationMin,
+    blastTiming,
+    scheduledShiftMin,
+  };
+
+  const jumboBolting =
+    (s.support?.jumboBolting ?? s.jumboBolting ?? s.supportConfig?.jumboBolting ?? false) === true;
+
+  const out: any = {
     simDays: pickNumber(s.simDays, s.days, s.simulationDays) ?? 30,
     tickMin: pickNumber(s.tickMin, s.dtMin, s.timeStepMin, s.stepMin) ?? 5,
     headings,
     metresPerRound: pickNumber(s.metresPerRound, s.advancePerRound, s.advanceM, s.mPerRound) ?? 3.8,
 
-    shift: {
-      shiftDurationMin,
-      blastTiming,
-    },
+    shift: shiftObj,
 
     durations: {
       drill,
@@ -492,7 +490,13 @@ function normalizeScenarioForEngine(input: any): Scenario {
     },
 
     resources,
+
+    support: {
+      jumboBolting,
+    },
   };
+
+  return out as Scenario;
 }
 
 function pickNumber(...vals: any[]): number | undefined {
@@ -503,15 +507,12 @@ function pickNumber(...vals: any[]): number | undefined {
 }
 
 function normalizeBlastTiming(v: any): BlastTiming {
-  // canonical
   if (v === "midshift" || v === "endOfShift") return v;
 
-  // legacy strings
   if (v === "IMMEDIATE" || v === "immediate") return "midshift";
   if (v === "END_OF_SHIFT_ONLY" || v === "endOfShift") return "endOfShift";
   if (v === "end") return "endOfShift";
 
-  // legacy booleans
   if (v === true) return "midshift";
   if (v === false) return "endOfShift";
 
@@ -533,7 +534,19 @@ function newHeading(id: string, s: Scenario): HeadingState {
   };
 }
 
-function shiftEndMin(nowMin: number, shiftDurationMin: number): number {
-  const start = Math.floor(nowMin / shiftDurationMin) * shiftDurationMin;
-  return start + shiftDurationMin;
+function getScheduledShiftMin(s: Scenario): number {
+  const v = (s.shift as any).scheduledShiftMin;
+  if (!Number.isFinite(v) || v <= 0) return s.shift.shiftDurationMin;
+  return Math.floor(Number(v));
+}
+
+function shiftBoundaries(nowMin: number, s: Scenario) {
+  const sched = getScheduledShiftMin(s);
+  const workable = Math.max(0, Math.min(sched, s.shift.shiftDurationMin));
+
+  const shiftStart = Math.floor(nowMin / sched) * sched;
+  const workEnd = shiftStart + workable; // shift change starts
+  const shiftEnd = shiftStart + sched; // next shift starts
+
+  return { shiftStart, workEnd, shiftEnd, sched, workable };
 }
