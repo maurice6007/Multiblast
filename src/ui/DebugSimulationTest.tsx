@@ -38,10 +38,11 @@ function clampNum(n: any, min = 0, fallback = 0) {
 
 /**
  * Canonical scenario template (engine-ish shape)
+ * NOTE: This template is deliberately resource-constrained so WAITING_FOR_RESOURCE is likely.
  */
 const STARTER_SCENARIO: any = {
   name: "Starter Scenario",
-  headings: 3,
+  headings: 6,
   simDays: 30,
   tickMin: 5,
   metresPerRound: 3.0,
@@ -59,7 +60,7 @@ const STARTER_SCENARIO: any = {
   },
 
   resources: {
-    drillRigs: 2,
+    drillRigs: 1,
     lhds: 1,
     supportCrews: 1,
     blastCrews: 1,
@@ -74,7 +75,7 @@ export default function DebugSimulationTest() {
   const [scenarioText, setScenarioText] = useState<string>(pretty(STARTER_SCENARIO));
 
   // Run controls
-  const [simDays, setSimDays] = useState<number>(30);
+  const [simDays, setSimDays] = useState<number>(STARTER_SCENARIO.simDays ?? 30);
   const [shiftsPerDay, setShiftsPerDay] = useState<2 | 3>(3);
   const [recordRuns, setRecordRuns] = useState<boolean>(true);
 
@@ -114,7 +115,12 @@ export default function DebugSimulationTest() {
 
     try {
       // wrapper reads legacyOptions.hoursPerShift for scheduled shift length
-      simulateScenario(parsed.value, { simDays: 1, hoursPerShift, recordRuns: false });
+      simulateScenario(parsed.value, {
+        simDays: 1,
+        hoursPerShift,
+        recordRuns: false,
+        includeTimeline: true,
+      });
       setRunError("");
     } catch (e: any) {
       setRunError(e?.message ?? String(e));
@@ -137,6 +143,7 @@ export default function DebugSimulationTest() {
         hoursPerShift,
         recordRuns,
         includeGantt: true,
+        includeTimeline: true,
       });
       setResult(r);
     } catch (e: any) {
@@ -162,6 +169,16 @@ export default function DebugSimulationTest() {
       })
       .filter(Boolean);
   }, [intervalsAll, viewMinutes]);
+
+  // Diagnostics: prove whether WAITING_FOR_RESOURCE exists
+  const waitingCount = useMemo(
+    () => intervals.filter((x: any) => x.stage === "WAITING_FOR_RESOURCE").length,
+    [intervals]
+  );
+
+  const uniqueStages = useMemo(() => {
+    return Array.from(new Set(intervals.map((x: any) => x.stage))).sort();
+  }, [intervals]);
 
   const blastTimingValue =
     uiScenario.shift.blastTiming === "midshift" || uiScenario.shift.blastTiming === "endOfShift"
@@ -205,7 +222,6 @@ export default function DebugSimulationTest() {
             onChange={(e) => {
               const v = Math.max(1, Number(e.target.value) || 1);
               setSimDays(v);
-              // keep JSON in sync so engine honours simDays (via Scenario)
               patchScenario((obj) => {
                 obj.simDays = v;
               });
@@ -308,7 +324,6 @@ export default function DebugSimulationTest() {
                 />
               </Field>
 
-              {/* Workable time before shift change (kept intentionally) */}
               <Field label="Shift duration (workable min)">
                 <input
                   type="number"
@@ -535,13 +550,15 @@ export default function DebugSimulationTest() {
       <div style={panelStyle}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 8 }}>
           <div style={{ fontWeight: 800 }}>Gantt</div>
-          <div style={{ fontSize: 12, opacity: 0.7 }}>Viewing 0 → {simDays} days</div>
+          <div style={{ fontSize: 12, opacity: 0.7 }}>
+            Viewing 0 → {simDays} days • Waiting intervals: {waitingCount} • Stages: {uniqueStages.join(", ")}
+          </div>
         </div>
 
         {intervals.length ? (
           <GanttChart simMinutes={viewMinutes} intervals={intervals} shiftsPerDay={shiftsPerDay} />
         ) : (
-          <div style={{ opacity: 0.7 }}>No timeline returned. Ensure engine returns intervals when includeGantt=true.</div>
+          <div style={{ opacity: 0.7 }}>No timeline returned. Ensure engine returns intervals when includeTimeline=true.</div>
         )}
       </div>
 
@@ -567,7 +584,7 @@ function normalizeScenario(partial: any) {
   const resources = s.resources ?? {};
   const supportCfg = s.support ?? {};
 
-  const headings = clampInt(s.headings, 1, 3);
+  const headings = clampInt(s.headings, 1, 6);
 
   return {
     simDays: clampInt(s.simDays, 1, 30),
@@ -589,10 +606,10 @@ function normalizeScenario(partial: any) {
     },
 
     resources: {
-      drillRigs: clampInt(resources.drillRigs ?? headings, 0, headings),
-      lhds: clampInt(resources.lhds ?? 1, 0, 1),
-      supportCrews: clampInt(resources.supportCrews ?? 1, 0, 1),
-      blastCrews: clampInt(resources.blastCrews ?? 1, 0, 1),
+      drillRigs: clampInt(resources.drillRigs ?? Math.max(1, headings - 1), 0, headings),
+      lhds: clampInt(resources.lhds ?? 1, 0, headings),
+      supportCrews: clampInt(resources.supportCrews ?? 1, 0, headings),
+      blastCrews: clampInt(resources.blastCrews ?? 1, 0, headings),
     },
 
     support: {

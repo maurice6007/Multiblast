@@ -1,9 +1,12 @@
 // src/engine/simulate.ts
-import type { Scenario, BlastTiming, Resources } from "../models/defaultScenario";
+import type { Scenario, BlastTiming } from "../models/defaultScenario";
 
 /* =========================
    Public exports
    ========================= */
+
+/** Resources a heading can be waiting for (used for Gantt WAITING_FOR_RESOURCE) */
+export type WaitForResource = "drillRigs" | "lhds" | "supportCrews" | "blastCrews";
 
 export interface SimulationKpis {
   simDays: number;
@@ -27,13 +30,16 @@ export type GanttStage =
   | "REENTRY"
   | "WAITING_FOR_BLAST"
   | "MUCK"
-  | "SUPPORT";
+  | "SUPPORT"
+  | "WAITING_FOR_RESOURCE";
 
 export interface GanttInterval {
   headingId: string;
   stage: GanttStage;
   startMin: number;
   endMin: number;
+  /** Only set when stage === "WAITING_FOR_RESOURCE" */
+  waitFor?: WaitForResource;
 }
 
 export interface SimulationDetailedResult {
@@ -58,12 +64,6 @@ export function simulateDetailed(s: Scenario): SimulationDetailedResult {
  * Back-compat wrapper for old UI:
  * - if includeGantt/includeTimeline: return { kpis, simMinutes, intervals }
  * - else return { kpis } so UI can always do result.kpis
- *
- * IMPORTANT:
- * - legacyOptions.hoursPerShift drives scheduled shift length (8h/12h) for end-of-shift blasting logic.
- * - s.shift.shiftDurationMin is workable time before shift change.
- * - shift change window = scheduledShiftMin - shiftDurationMin.
- * - blast crews are consumed by CHARGE; blasting is instantaneous.
  */
 export function simulateScenario(legacyScenario: any, legacyOptions?: any): any {
   const normalized = normalizeScenarioForEngine(legacyScenario, legacyOptions);
@@ -78,12 +78,12 @@ export function simulateScenario(legacyScenario: any, legacyOptions?: any): any 
    Internal state
    ========================= */
 
-type Stage = GanttStage;
+type WorkStage = Exclude<GanttStage, "WAITING_FOR_RESOURCE">;
 
 interface HeadingState {
   id: string;
-  stage: Stage;
-  remainingMin: number; // countdown for work stages AND gating stages
+  stage: WorkStage;
+  remainingMin: number;
   busyMin: number;
   roundsCompleted: number;
   metresAdvanced: number;
@@ -99,8 +99,9 @@ interface RunResult {
   intervals: GanttInterval[];
 }
 
-type ResourceKey = keyof Resources;
-type ResourcePool = Resources;
+/** Local resource shape (do NOT rely on external types) */
+type ResourceKey = WaitForResource;
+type ResourcePool = Record<ResourceKey, number>;
 
 const REENTRY_MIN_MIDSHIFT = 30;
 
@@ -118,21 +119,36 @@ function runEngine(s: Scenario, opts: RunOptions): RunResult {
 
   // --- timeline capture ---
   const intervals: GanttInterval[] = [];
-  const openByHeading = new Map<string, { stage: Stage; startMin: number }>();
+  const openByHeading = new Map<string, { stage: GanttStage; startMin: number; waitFor?: ResourceKey }>();
 
-  const closeAndOpenIfStageChanged = (h: HeadingState, nowMin: number) => {
+  const openIfMissing = (hid: string, stage: GanttStage, nowMin: number, waitFor?: ResourceKey) => {
+    if (!opts.captureTimeline) return;
+    if (!openByHeading.has(hid)) openByHeading.set(hid, { stage, startMin: nowMin, waitFor });
+  };
+
+  const closeAndOpen = (hid: string, nextStage: GanttStage, nextWaitFor: ResourceKey | undefined, atMin: number) => {
     if (!opts.captureTimeline) return;
 
-    const open = openByHeading.get(h.id);
+    const open = openByHeading.get(hid);
     if (!open) {
-      openByHeading.set(h.id, { stage: h.stage, startMin: nowMin });
+      openByHeading.set(hid, { stage: nextStage, startMin: atMin, waitFor: nextWaitFor });
       return;
     }
 
-    if (open.stage !== h.stage) {
-      intervals.push({ headingId: h.id, stage: open.stage, startMin: open.startMin, endMin: nowMin });
-      openByHeading.set(h.id, { stage: h.stage, startMin: nowMin });
-    }
+    const stageChanged = open.stage !== nextStage;
+    const waitChanged = open.waitFor !== nextWaitFor;
+
+    if (!stageChanged && !waitChanged) return;
+
+    intervals.push({
+      headingId: hid,
+      stage: open.stage,
+      startMin: open.startMin,
+      endMin: atMin,
+      waitFor: open.waitFor,
+    });
+
+    openByHeading.set(hid, { stage: nextStage, startMin: atMin, waitFor: nextWaitFor });
   };
 
   if (opts.captureTimeline) {
@@ -140,18 +156,34 @@ function runEngine(s: Scenario, opts: RunOptions): RunResult {
   }
 
   for (let nowMin = 0; nowMin < simMinutes; nowMin += tickMin) {
-    // reset available resources each tick
-    const avail: ResourcePool = makeResourcePool(s);
+    // reset available resources each tick (shared across headings for this tick)
+    const avail = makeResourcePool(s);
 
-    // Advance each heading if it can acquire the resource for its current stage
     for (const h of headings) {
-      const beforeStage = h.stage;
+      const logicalStageBefore = h.stage;
 
-      advanceHeadingByTick(h, nowMin, tickMin, s, avail);
+      // attempt to advance (may be blocked)
+      const progressed = advanceHeadingByTick(h, nowMin, tickMin, s, avail);
 
-      if (opts.captureTimeline && h.stage !== beforeStage) {
-        // stage change effective end-of-tick
-        closeAndOpenIfStageChanged(h, nowMin + tickMin);
+      // If blocked on a work stage, compute which resource we are waiting for.
+      const waitFor: ResourceKey | undefined =
+        progressed ? undefined : (resourceForWorkStage(logicalStageBefore, s) ?? undefined);
+
+      // Display either the logical stage, or WAITING_FOR_RESOURCE if blocked on a resource.
+      const displayStage: GanttStage = progressed ? h.stage : waitFor ? "WAITING_FOR_RESOURCE" : h.stage;
+      const nextWaitFor = displayStage === "WAITING_FOR_RESOURCE" ? waitFor : undefined;
+
+      if (opts.captureTimeline) {
+        const open = openByHeading.get(h.id);
+        const currentOpenStage = open?.stage ?? h.stage;
+        const currentOpenWaitFor = open?.waitFor;
+
+        openIfMissing(h.id, currentOpenStage, nowMin, currentOpenWaitFor);
+
+        // split interval when stage OR waitFor changes
+        if (displayStage !== currentOpenStage || nextWaitFor !== currentOpenWaitFor) {
+          closeAndOpen(h.id, displayStage, nextWaitFor, nowMin + tickMin);
+        }
       }
     }
   }
@@ -159,25 +191,44 @@ function runEngine(s: Scenario, opts: RunOptions): RunResult {
   if (opts.captureTimeline) {
     for (const h of headings) {
       const open = openByHeading.get(h.id);
-      if (open) intervals.push({ headingId: h.id, stage: open.stage, startMin: open.startMin, endMin: simMinutes });
+      if (open) {
+        intervals.push({
+          headingId: h.id,
+          stage: open.stage,
+          startMin: open.startMin,
+          endMin: simMinutes,
+          waitFor: open.waitFor,
+        });
+      }
     }
   }
 
   const kpis = computeKpis(headings, s, simMinutes);
-  assertSimulationProgress(kpis, s);
+  assertSimulationProgress(s, headings);
 
   return { kpis, simMinutes, intervals };
 }
 
 /* =========================
-   Core simulation logic (resource-constrained)
+   Core simulation logic
    ========================= */
 
-function advanceHeadingByTick(h: HeadingState, nowMin: number, tickMin: number, s: Scenario, avail: ResourcePool): void {
+/**
+ * Returns:
+ *  - true  = progressed this tick (worked or advanced a timer or changed stage)
+ *  - false = blocked waiting for a resource for this stage
+ */
+function advanceHeadingByTick(
+  h: HeadingState,
+  nowMin: number,
+  tickMin: number,
+  s: Scenario,
+  avail: ResourcePool
+): boolean {
   // Gate stages (no resources)
   if (h.stage === "BLAST_READY") {
     onBlastReady(h, nowMin, tickMin, s);
-    return;
+    return true;
   }
 
   if (h.stage === "REENTRY") {
@@ -186,7 +237,7 @@ function advanceHeadingByTick(h: HeadingState, nowMin: number, tickMin: number, 
       h.stage = "MUCK";
       h.remainingMin = s.durations.muck;
     }
-    return;
+    return true;
   }
 
   if (h.stage === "WAITING_FOR_BLAST") {
@@ -195,35 +246,35 @@ function advanceHeadingByTick(h: HeadingState, nowMin: number, tickMin: number, 
       h.stage = "MUCK";
       h.remainingMin = s.durations.muck;
     }
-    return;
+    return true;
   }
 
-  // Determine if this stage needs a resource to do work
-  const rKey = resourceForWorkStage(h.stage, s);
-  const canWorkThisTick = rKey ? tryConsume(avail, rKey) : true;
-
-  if (!canWorkThisTick) return;
+  // Work stage: must acquire resource (if any)
+  const key = resourceForWorkStage(h.stage, s);
+  if (key) {
+    if (avail[key] <= 0) return false;
+    avail[key] -= 1;
+  }
 
   // Work happens this tick
   h.busyMin += tickMin;
 
   if (h.remainingMin > 0) h.remainingMin = Math.max(0, h.remainingMin - tickMin);
-  if (h.remainingMin > 0) return;
+  if (h.remainingMin > 0) return true;
 
   switch (h.stage) {
     case "DRILL":
       h.stage = "CHARGE";
       h.remainingMin = s.durations.charge;
-      return;
+      return true;
 
     case "CHARGE":
-      // Charging consumes blast crews. Blast is instantaneous and handled by BLAST_READY gating.
       h.stage = "BLAST_READY";
       h.remainingMin = 0;
-      return;
+      return true;
 
     case "MUCK": {
-      const support = Number.isFinite(s.durations.support) ? (s.durations.support as number) : 0;
+      const support = Number.isFinite((s.durations as any).support) ? Number((s.durations as any).support) : 0;
       if (support > 0) {
         h.stage = "SUPPORT";
         h.remainingMin = support;
@@ -232,29 +283,24 @@ function advanceHeadingByTick(h: HeadingState, nowMin: number, tickMin: number, 
         h.stage = "DRILL";
         h.remainingMin = s.durations.drill;
       }
-      return;
+      return true;
     }
 
     case "SUPPORT":
       completeRound(h, s);
       h.stage = "DRILL";
       h.remainingMin = s.durations.drill;
-      return;
+      return true;
 
     default:
-      return;
+      return true;
   }
 }
 
 /**
  * BLAST_READY handler.
- * - midshift (ASAP): blast instantaneous → REENTRY(30 min) → MUCK
- * - endOfShift: blast occurs during shift change; re-entry is engulfed by shift change window:
- *      WAITING_FOR_BLAST = scheduledShiftMin - shiftDurationMin
- *
- * End-of-shift modeled as:
- *  - BLAST_READY counts down to workEnd (start of shift change)
- *  - then WAITING_FOR_BLAST counts down to shiftEnd (next shift start) → MUCK
+ * - midshift: blast instantaneous → REENTRY(30 min) → MUCK
+ * - endOfShift: blast at shift change → WAITING_FOR_BLAST until shift end → MUCK
  */
 function onBlastReady(h: HeadingState, nowMin: number, tickMin: number, s: Scenario): void {
   if (s.shift.blastTiming === "midshift") {
@@ -265,16 +311,12 @@ function onBlastReady(h: HeadingState, nowMin: number, tickMin: number, s: Scena
 
   const { workEnd, shiftEnd } = shiftBoundaries(nowMin, s);
 
-  // If we are already in shift change window, transition to waiting immediately
   if (nowMin >= workEnd) {
     h.stage = "WAITING_FOR_BLAST";
-    const effectiveNow = nowMin + tickMin;
-    h.remainingMin = Math.max(0, shiftEnd - effectiveNow);
+    h.remainingMin = Math.max(0, shiftEnd - (nowMin + tickMin));
     return;
   }
 
-  // Still in workable time: remain BLAST_READY until shift change starts.
-  // Use remainingMin as countdown to workEnd.
   if (h.remainingMin <= 0) {
     h.remainingMin = Math.max(0, workEnd - nowMin);
   } else {
@@ -283,8 +325,7 @@ function onBlastReady(h: HeadingState, nowMin: number, tickMin: number, s: Scena
 
   if (h.remainingMin === 0) {
     h.stage = "WAITING_FOR_BLAST";
-    const effectiveNow = nowMin + tickMin;
-    h.remainingMin = Math.max(0, shiftEnd - effectiveNow);
+    h.remainingMin = Math.max(0, shiftEnd - (nowMin + tickMin));
   }
 }
 
@@ -298,18 +339,12 @@ function completeRound(h: HeadingState, s: Scenario): void {
    ========================= */
 
 function makeResourcePool(s: Scenario): ResourcePool {
-  const r = s.resources ?? {
-    drillRigs: s.headings,
-    lhds: s.headings,
-    supportCrews: s.headings,
-    blastCrews: 1,
-  };
-
+  const r = (s as any).resources ?? {};
   return {
-    drillRigs: clampNonNegInt(r.drillRigs),
-    lhds: clampNonNegInt(r.lhds),
-    supportCrews: clampNonNegInt(r.supportCrews),
-    blastCrews: clampNonNegInt(r.blastCrews),
+    drillRigs: clampNonNegInt(r.drillRigs ?? s.headings),
+    lhds: clampNonNegInt(r.lhds ?? s.headings),
+    supportCrews: clampNonNegInt(r.supportCrews ?? s.headings),
+    blastCrews: clampNonNegInt(r.blastCrews ?? 1),
   };
 }
 
@@ -323,27 +358,19 @@ function isJumboBoltingEnabled(s: Scenario): boolean {
   return (s as any)?.support?.jumboBolting === true;
 }
 
-function resourceForWorkStage(stage: Stage, s: Scenario): ResourceKey | null {
+function resourceForWorkStage(stage: WorkStage, s: Scenario): ResourceKey | null {
   switch (stage) {
     case "DRILL":
       return "drillRigs";
     case "CHARGE":
-      // blast crews do charging-up
       return "blastCrews";
     case "MUCK":
       return "lhds";
     case "SUPPORT":
-      // Jumbo bolting consumes drill rigs; otherwise use dedicated support crews
       return isJumboBoltingEnabled(s) ? "drillRigs" : "supportCrews";
     default:
       return null;
   }
-}
-
-function tryConsume(avail: ResourcePool, key: ResourceKey): boolean {
-  if (avail[key] <= 0) return false;
-  avail[key] -= 1;
-  return true;
 }
 
 /* =========================
@@ -409,21 +436,24 @@ function validateScenario(s: Scenario): void {
   if (!Number.isFinite(s.durations.charge)) throw new Error("durations.charge is missing/invalid");
   if (!Number.isFinite(s.durations.muck)) throw new Error("durations.muck is missing/invalid");
 
-  if (s.durations.support !== undefined && (!Number.isFinite(s.durations.support) || s.durations.support! < 0)) {
+  const supportVal = (s.durations as any).support;
+  if (supportVal !== undefined && (!Number.isFinite(supportVal) || Number(supportVal) < 0)) {
     throw new Error("durations.support must be >= 0 if provided");
   }
 
-  if (s.resources) {
+  const resources = (s as any).resources;
+  if (resources) {
     for (const k of ["drillRigs", "lhds", "supportCrews", "blastCrews"] as const) {
-      const v = (s.resources as any)[k];
+      const v = (resources as any)[k];
       if (!Number.isFinite(v) || v < 0) throw new Error(`resources.${k} must be >= 0`);
     }
   }
 }
 
-function assertSimulationProgress(kpis: SimulationKpis, s: Scenario): void {
-  if (s.simDays >= 1 && kpis.roundsCompletedTotal === 0) {
-    throw new Error("Simulation produced zero completed rounds (deadlock).");
+function assertSimulationProgress(s: Scenario, headings: HeadingState[]): void {
+  const totalBusy = headings.reduce((a, h) => a + h.busyMin, 0);
+  if (s.simDays >= 1 && totalBusy === 0) {
+    throw new Error("Simulation produced zero work (deadlock: no resources available to perform any stage).");
   }
 }
 
@@ -450,53 +480,35 @@ function normalizeScenarioForEngine(input: any, legacyOptions?: any): Scenario {
 
   const headings = pickNumber(s.headings, s.numHeadings, s.activeHeadings) ?? 2;
 
-  const resourcesSrc = s.resources ?? {};
-  const resources: Resources = {
+  const resourcesSrc = (s as any).resources ?? {};
+  const resources: any = {
     drillRigs: pickNumber(resourcesSrc.drillRigs, s.drillRigs) ?? headings,
     lhds: pickNumber(resourcesSrc.lhds, s.lhds) ?? headings,
     supportCrews: pickNumber(resourcesSrc.supportCrews, s.supportCrews) ?? headings,
     blastCrews: pickNumber(resourcesSrc.blastCrews, s.blastCrews) ?? 1,
   };
 
-  // Scheduled shift length comes from legacyOptions.hoursPerShift (8h / 12h)
   const hoursPerShiftOpt = legacyOptions?.hoursPerShift;
   const scheduledShiftMin =
     Number.isFinite(hoursPerShiftOpt) && Number(hoursPerShiftOpt) > 0
       ? Number(hoursPerShiftOpt) * 60
-      : pickNumber(shiftSrc.scheduledShiftMin, s.scheduledShiftMin, s.shiftScheduledMin) ?? shiftDurationMin;
+      : pickNumber((shiftSrc as any).scheduledShiftMin, s.scheduledShiftMin, s.shiftScheduledMin) ?? shiftDurationMin;
 
-  const shiftObj: any = {
-    shiftDurationMin,
-    blastTiming,
-    scheduledShiftMin,
-  };
+  const shiftObj: any = { shiftDurationMin, blastTiming, scheduledShiftMin };
 
   const jumboBolting =
-    (s.support?.jumboBolting ?? s.jumboBolting ?? s.supportConfig?.jumboBolting ?? false) === true;
+    ((s as any).support?.jumboBolting ?? s.jumboBolting ?? (s as any).supportConfig?.jumboBolting ?? false) === true;
 
-  const out: any = {
+  return {
     simDays: pickNumber(s.simDays, s.days, s.simulationDays) ?? 30,
     tickMin: pickNumber(s.tickMin, s.dtMin, s.timeStepMin, s.stepMin) ?? 5,
     headings,
     metresPerRound: pickNumber(s.metresPerRound, s.advancePerRound, s.advanceM, s.mPerRound) ?? 3.8,
-
     shift: shiftObj,
-
-    durations: {
-      drill,
-      charge,
-      muck,
-      support,
-    },
-
+    durations: { drill, charge, muck, support } as any,
     resources,
-
-    support: {
-      jumboBolting,
-    },
-  };
-
-  return out as Scenario;
+    support: { jumboBolting },
+  } as any as Scenario;
 }
 
 function pickNumber(...vals: any[]): number | undefined {
@@ -508,14 +520,11 @@ function pickNumber(...vals: any[]): number | undefined {
 
 function normalizeBlastTiming(v: any): BlastTiming {
   if (v === "midshift" || v === "endOfShift") return v;
-
   if (v === "IMMEDIATE" || v === "immediate") return "midshift";
   if (v === "END_OF_SHIFT_ONLY" || v === "endOfShift") return "endOfShift";
   if (v === "end") return "endOfShift";
-
   if (v === true) return "midshift";
   if (v === false) return "endOfShift";
-
   return "endOfShift";
 }
 
@@ -545,8 +554,8 @@ function shiftBoundaries(nowMin: number, s: Scenario) {
   const workable = Math.max(0, Math.min(sched, s.shift.shiftDurationMin));
 
   const shiftStart = Math.floor(nowMin / sched) * sched;
-  const workEnd = shiftStart + workable; // shift change starts
-  const shiftEnd = shiftStart + sched; // next shift starts
+  const workEnd = shiftStart + workable;
+  const shiftEnd = shiftStart + sched;
 
   return { shiftStart, workEnd, shiftEnd, sched, workable };
 }

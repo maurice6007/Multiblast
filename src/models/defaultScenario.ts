@@ -2,40 +2,35 @@
 
 export type BlastTiming = "midshift" | "endOfShift";
 
+export interface Resources {
+  drillRigs: number;
+  lhds: number;
+  supportCrews: number;
+  blastCrews: number;
+}
+
 export interface Scenario {
   simDays: number;
   tickMin: number;
-
   headings: number;
   metresPerRound: number;
 
   shift: {
-    shiftDurationMin: number;
+    shiftDurationMin: number;        // workable minutes
     blastTiming: BlastTiming;
+    scheduledShiftMin?: number;      // total scheduled shift length (workable + change window)
   };
 
   durations: {
     drill: number;
     charge: number;
     muck: number;
+    support?: number;               // OPTIONAL support stage
+  };
+
+  resources?: Resources;            // OPTIONAL resource constraints
+
+  support?: {
+    jumboBolting?: boolean;         // OPTIONAL toggle
   };
 }
-
-export const defaultScenario: Scenario = {
-  simDays: 30,
-  tickMin: 5,
-
-  headings: 2,
-  metresPerRound: 3.8,
-
-  shift: {
-    shiftDurationMin: 720,
-    blastTiming: "endOfShift",
-  },
-
-  durations: {
-    drill: 180,
-    charge: 60,
-    muck: 240,
-  },
-};

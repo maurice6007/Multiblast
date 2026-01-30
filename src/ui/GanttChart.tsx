@@ -1,6 +1,6 @@
 // src/ui/GanttChart.tsx
 import React from "react";
-import type { GanttInterval } from "../engine/simulate";
+import type { GanttInterval, WaitForResource } from "../engine/simulate";
 
 const STAGE_LABEL: Record<string, string> = {
   DRILL: "Drill",
@@ -10,16 +10,25 @@ const STAGE_LABEL: Record<string, string> = {
   WAITING_FOR_BLAST: "Waiting blast",
   MUCK: "Muck",
   SUPPORT: "Support",
+  WAITING_FOR_RESOURCE: "Waiting resource",
 };
 
 const STAGE_COLOR: Record<string, string> = {
-  DRILL: "#bfdbfe", // blue
-  CHARGE: "#fde68a", // yellow
+  DRILL: "#0c77f9", // blue
+  CHARGE: "#fb0707", // red
   BLAST_READY: "#e9d5ff", // purple
   REENTRY: "#fdba74", // orange
   WAITING_FOR_BLAST: "#e5e7eb", // grey
-  MUCK: "#bbf7d0", // green
-  SUPPORT: "#d6b48c", // brown / sand
+  MUCK: "#13b54b", // green
+  SUPPORT: "#c1996b", // brown / sand
+  WAITING_FOR_RESOURCE: "#5c5b5b", // dark grey
+};
+
+const WAIT_FOR_LABEL: Record<WaitForResource, string> = {
+  drillRigs: "Drill rig",
+  lhds: "LHD",
+  supportCrews: "Support crew",
+  blastCrews: "Blast crew",
 };
 
 type Props = {
@@ -34,6 +43,14 @@ function buildShiftMarkers(simMinutes: number, shiftsPerDay: 2 | 3): number[] {
   const markers: number[] = [];
   for (let t = step; t < total; t += step) markers.push(t);
   return markers;
+}
+
+function segTitle(seg: GanttInterval) {
+  if (seg.stage === "WAITING_FOR_RESOURCE") {
+    const w = seg.waitFor ? WAIT_FOR_LABEL[seg.waitFor] : "resource";
+    return `Waiting for ${w}: ${seg.startMin} → ${seg.endMin} min`;
+  }
+  return `${STAGE_LABEL[seg.stage] ?? seg.stage}: ${seg.startMin} → ${seg.endMin} min`;
 }
 
 export default function GanttChart({ simMinutes, intervals, shiftsPerDay }: Props) {
@@ -93,7 +110,7 @@ export default function GanttChart({ simMinutes, intervals, shiftsPerDay }: Prop
                   return (
                     <div
                       key={i}
-                      title={`${STAGE_LABEL[seg.stage] ?? seg.stage}: ${seg.startMin} → ${seg.endMin} min`}
+                      title={segTitle(seg)}
                       style={{
                         position: "absolute",
                         top: 0,
